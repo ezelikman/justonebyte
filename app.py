@@ -56,12 +56,15 @@ class Machine:
 
         @self.app.route('/model', methods=['GET'])
         def get_model():
-            while self.perturbed:
+            while self.perturbed and (self.backup_weights is None):
                 time.sleep(0.1)
             if self.model is not None:
-                self.sending_weights = True
-                torch.save(self.model.state_dict(), 'temp_model.pt')
-                self.sending_weights = False
+                if self.backup_weights is None::
+                    self.sending_weights = True
+                    torch.save(self.model.state_dict(), 'temp_model.pt')
+                    self.sending_weights = False
+                else:
+                    torch.save(self.backup_weights, 'temp_model.pt')
                 return send_file('temp_model.pt', as_attachment=True)
             else:
                 return {'error': 'Model not initialized'}, 500
@@ -240,12 +243,13 @@ class Machine:
                 if self.use_backup:
                     print("Backing up weights.")
                     self.backup_weights = {k: v.cpu() for k, v in self.model.state_dict().items()}
-                print("Starting training.")
+                print("Calculating losses.")
                 self.update_weights()
-                all_projected_grads = self.request_grads_from_all_machines()
                 if self.use_backup:
                     print("Restoring weights.")
                     self.model.load_state_dict(self.backup_weights)
+                print("Requesting gradients.")
+                all_projected_grads = self.request_grads_from_all_machines()
                 print("Applying gradients.")
                 self.apply_all_grads(all_projected_grads)
                 print("Finished training for this round ending at", self.end_time)
