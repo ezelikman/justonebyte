@@ -93,7 +93,10 @@ class Machine:
                 for address in self.all_addresses:
                     if address != addr:
                         print(f"Notifying {address} about {addr} at {ts}")
-                        requests.post(f"{address}/notify", json={'address': addr, 'timestamp': ts})
+                        try:
+                            requests.post(f"{address}/notify", json={'address': addr, 'timestamp': ts})
+                        except:
+                            print(f"Failed to notify {address} about {addr} at {ts}")
             return {'all_addresses': self.all_addresses, 'timestamps': self.addresses_timestamp, 'end_time': self.end_time, 'learning_rate': self.learning_rate, 'total_iterations': self.total_iterations}, 200
 
     ### Initialization functions ###
@@ -132,7 +135,11 @@ class Machine:
 
     def announce_existence(self):
         for address in self.all_addresses:
-            response = requests.post(f"{address}/notify", json={'address': self.my_address, 'timestamp': self.timestamp}).json()
+            try:
+                response = requests.post(f"{address}/notify", json={'address': self.my_address, 'timestamp': self.timestamp}).json()
+            except:
+                print(f"Could not connect to {address}")
+                continue
             for addr in response['all_addresses']:
                 if addr not in self.all_addresses and addr != self.my_address:
                     self.all_addresses.append(addr)
