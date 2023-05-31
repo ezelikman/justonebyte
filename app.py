@@ -59,7 +59,7 @@ class Machine:
             while self.perturbed and (self.backup_weights is None):
                 time.sleep(0.1)
             if self.model is not None:
-                if self.backup_weights is None::
+                if self.backup_weights is None:
                     self.sending_weights = True
                     torch.save(self.model.state_dict(), 'temp_model.pt')
                     self.sending_weights = False
@@ -98,7 +98,7 @@ class Machine:
 
     ### Initialization functions ###
     def initialize_run(self):
-        self.initialize_model(use_default=True)
+        self.initialize_model()
         self.end_time = time.time() + self.increment_time
         self.learning_rate = 1e-1
 
@@ -187,9 +187,13 @@ class Machine:
             self.my_address: self.projected_grads
         }
         for address in self.all_addresses:
-            response = requests.get(f"{address}/grads").json()
-            if not 'grads' in response:
-                print(f"Error: {response['error']}")
+            try:
+                response = requests.get(f"{address}/grads").json()
+                if not 'grads' in response:
+                    print(f"Error: {response['error']}")
+                    continue
+            except:
+                print(f"Error: could not connect to {address}")
                 continue
             all_projected_grads[address] = response['grads']
         return all_projected_grads
