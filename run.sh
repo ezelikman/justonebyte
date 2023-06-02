@@ -3,10 +3,10 @@ START_IP=$(cat start_ip.txt)
 
 
 
-for model_name in gpt2 decapoda-research/llama-7b-hf
+for model_name in llama-7b-hf
 do
     echo $model_name
-
+    
     echo "FF"
     CUDA_VISIBLE_DEVICES=0 CUBLAS_WORKSPACE_CONFIG=:4096:8 python3 app.py --start_ip $START_IP --self_ip=$IP --model_name $model_name > "${model_name}_FF_${IP}" 2>&1
     sleep 60

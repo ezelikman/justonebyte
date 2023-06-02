@@ -50,7 +50,7 @@ class Machine:
         self.dataset = load_dataset(*self.dataset_name)['train']  # Initialize the dataset
         self.model_name = model_name  # Name of the model to be used
         if "llama" in model_name:
-            self.tokenizer = LlamaTokenizer.from_pretrained(model_name)
+            self.tokenizer = LlamaTokenizer.from_pretrained("decapoda-research/" + model_name)
         else:
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)  # Tokenizer for the model
         if self.tokenizer.pad_token is None:  # Add a padding token if there isn't one - common
@@ -64,7 +64,8 @@ class Machine:
         self.num_finish = {
             "finish initialize model": 0,
             "finish forward pass": 0,
-            "finish applying gradients": 0
+            "finish applying gradients": 0,
+            "exit": 0,
         }
         self.use_different_gpu = use_different_gpu
         self.debug = debug
@@ -129,6 +130,12 @@ class Machine:
                             print(f"Failed to notify {address} about {addr} at {ts}")
             return {'all_addresses': self.all_addresses, 'timestamps': self.addresses_timestamp, 'end_time': self.end_time, 'learning_rate': self.learning_rate, 'total_iterations': self.total_iterations}, 200
 
+        @self.app.route('/shutdown', methods=['POST'])
+        def shutdown():
+            self.server.shutdown()
+            return 'Server shutting down...'
+
+
     ### Initialization functions ###
     def initialize_run(self):
         self.initialize_model()
@@ -137,7 +144,7 @@ class Machine:
         if use_default or self.total_iterations == 0:
             print("Initializing default model")
             self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name
+                self.model_name if not "llama" in self.model_name else "decapoda-research/" + self.model_name,
             ).eval()
         else:
             random_address = np.random.choice(self.all_addresses)
@@ -147,7 +154,7 @@ class Machine:
             with open('received_model.pt', 'wb') as f:
                 f.write(response.content)
             # Load from pretrained config
-            config = AutoConfig.from_pretrained(self.model_name)
+            config = AutoConfig.from_pretrained(self.model_name if not "llama" in self.model_name else "decapoda-research/" + self.model_name)
             self.model = AutoModelForCausalLM.from_config(config).eval()
         resize_token_embeddings(self.model, len(self.tokenizer))
         if not use_default and self.total_iterations != 0:
@@ -160,7 +167,7 @@ class Machine:
     ### Server functions ###
     def start_server(self, port):
         self.app.run(host="0.0.0.0", port=port)
-
+    
     def announce_existence(self):
         for address in self.all_addresses:
             try:
@@ -260,8 +267,7 @@ class Machine:
         if self.sample_number < self.gradient_acc_steps:
             print("Warning: did not have enough samples to reach desired gradients accumulation steps.")
         # Write mean loss to loss.txt
-        model_name = self.model_name.split('/')[-1]
-        with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}.txt', 'a+') as f:
+        with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}.txt', 'a+') as f:
             f.write(self.my_address+": " + str(np.mean(self.losses)) + " start inference time: " + str(start_round_time - self.timestamp)  +" finish inference time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + " num samples: " + str(self.sample_number) + '\n')
 
     def request_grads_from_all_machines(self):
@@ -309,8 +315,7 @@ class Machine:
                         -self.learning_rate * grad / num_samples,
                         self.addresses_timestamp[address], grad_idx, self.debug)
         self.perturbed = False
-        model_name = self.model_name.split('/')[-1]
-        with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}.txt', 'a+') as f:
+        with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}.txt', 'a+') as f:
             f.write(self.my_address+": " + str(np.mean(self.losses)) + " start grad time: " + str(start_round_time - self.timestamp)  +" finish grad time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + " num samples: " + str(num_samples) + '\n')
 
     def notify_finish(self, description="initialize"):
@@ -372,7 +377,8 @@ class Machine:
                 print(f"Finished training for iteration {self.total_iterations} ending at", time.time())
                 if self.all_addresses:  # Choose a random address to check the hash
                     self.model = confirm_hash(np.random.choice(self.all_addresses), self.model)
-                
+            
+        self.sync("exit")
 
 def calculate_loss(model, tokenizer, batch):
     tokenized_batch = tokenizer(batch, return_tensors='pt', padding=True, truncation=True, return_token_type_ids=False if "llama" in tokenizer.name_or_path else None)
@@ -462,3 +468,6 @@ if __name__ == '__main__':
     server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate)
     Thread(target=server.start_server, args=(args.port,)).start()
     server.run()
+    # close server after done training
+    requests.post('http://0.0.0.0:{}/shutdown'.format(args.port))
+
