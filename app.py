@@ -402,7 +402,7 @@ def model_processing(model, dtype, device, use_lora):
 
 def set_seed(total_iterations, timestamp, sample_number):
     timer = int(f'{timestamp:.6f}'.replace('.', ''))
-    full_seed = int(f'{total_iterations}{sample_number:05}{timer}')
+    full_seed = int(f'{total_iterations}{sample_number:05}{timer}') % 9223372036854775806
     torch.manual_seed(full_seed)
     torch.cuda.manual_seed(full_seed)
 
