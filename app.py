@@ -59,10 +59,15 @@ class Machine:
         self.use_backup = use_backup
         self.backup_weights = None
         self.total_iterations = 0
-        self.num_finish_update_grad = 0
+        self.num_finish = {
+            "finish initialize model": 0,
+            "finish forward pass": 0,
+            "finish applying gradients": 0
+        }
         self.use_different_gpu = use_different_gpu
         self.debug = debug
         self.gradient_acc_steps=gradient_acc_steps
+        self.max_iterations = 300
         self.learning_rate=learning_rate # learning rate for the optimizer; will be overwritten by the main machine if it is not the main machine
         self.app = Flask(__name__)
 
@@ -101,10 +106,11 @@ class Machine:
             else:
                 return {'error': 'Model not initialized'}, 500
         
-        @self.app.route('/notify_finish_update_grad', methods=['POST'])
-        def update_num_finish_update_grad():
-            self.num_finish_update_grad += 1
-            return {'num_finish_update_grad': self.num_finish_update_grad}
+        @self.app.route('/notify_finish', methods=['POST'])
+        def update_num_finish():
+            description = request.json['description']
+            self.num_finish[description] += 1
+            return {'num_finish': self.num_finish[description]}, 200
 
         @self.app.route('/notify', methods=['POST'])
         def notify_new_server():
@@ -163,7 +169,12 @@ class Machine:
                 response = requests.post(f"{address}/notify", json={'address': self.my_address, 'timestamp': self.timestamp}).json()
             except:
                 print(f"Could not connect to {address}")
+                if self.all_addresses and address not in self.addresses_timestamp:
+                    time.sleep(1)
+                    self.announce_existence()
+                    break
                 continue
+        
             for addr in response['all_addresses']:
                 if addr not in self.all_addresses and addr != self.my_address:
                     self.all_addresses.append(addr)
@@ -176,6 +187,8 @@ class Machine:
     ### Training functions ###
     def add_perturbation(self, scaling_factor, timestamp, sample_number, debug=False):
         # set_seed(self.end_time, timestamp, sample_number)
+        # torch.cuda.synchronize()
+        # s = time.time()
         set_seed(self.total_iterations, sample_number)
         for param_name, param in self.model.named_parameters():
             if self.use_lora and 'lora' not in param_name:
@@ -187,6 +200,7 @@ class Machine:
             else:
                 z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
             param.data = param.data + scaling_factor * z * self.epsilon
+        # print(f"Time to add perturbation: {time.time() - s}")
            
     def get_model_grad(self):
         for param_name, param in self.model.named_parameters():
@@ -263,8 +277,9 @@ class Machine:
         if self.sample_number < self.gradient_acc_steps:
             print("Warning: did not have enough samples to reach desired gradients accumulation steps.")
         # Write mean loss to loss.txt
-        with open(f'loss_send_full_grad={self.send_full_grad}_normal={self.normal}_{self.addresses_timestamp[self.main_machine_address]}.txt', 'a+') as f:
-            f.write(self.my_address+": " + str(np.mean(self.losses)) + " start inference time: " + str(start_round_time - self.timestamp)  +" finish inference time: " + str(time.time() - self.timestamp) + " num_samples: " + str(self.sample_number) + '\n')
+        model_name = self.model_name.split('/')[-1]
+        with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.addresses_timestamp[self.main_machine_address]}.txt', 'a+') as f:
+            f.write(self.my_address+": " + str(np.mean(self.losses)) + " start inference time: " + str(start_round_time - self.timestamp)  +" finish inference time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + '\n')
         # while time.time() < self.end_time - self.buffer_time:
         #     time.sleep(0.1)
 
@@ -311,59 +326,62 @@ class Machine:
                 for grad_idx, grad in enumerate(address_grads):
                     if self.debug:
                         breakpoint()
-                    calculate_hash(self.model)
-                    # s = time.time()
                     self.add_perturbation(
                         -self.learning_rate * grad / num_samples,
                         self.addresses_timestamp[address], grad_idx, self.debug)
-                    # print(f"Time to add perturbation: {time.time() - s}")
         self.perturbed = False
-        with open(f'loss_send_full_grad={self.send_full_grad}_normal={self.normal}_{self.addresses_timestamp[self.main_machine_address]}.txt', 'a+') as f:
-            f.write(self.my_address+": " + str(np.mean(self.losses)) + " start grad time: " + str(start_round_time - self.timestamp)  +" finish grad time: " + str(time.time() - self.timestamp) +  '\n')
+        model_name = self.model_name.split('/')[-1]
+        with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.addresses_timestamp[self.main_machine_address]}.txt', 'a+') as f:
+            f.write(self.my_address+": " + str(np.mean(self.losses)) + " start grad time: " + str(start_round_time - self.timestamp)  +" finish grad time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + '\n')
         
         
-    def notify_finish_update_grad(self):
+    def notify_finish(self, description="initialize"):
         for address in self.all_addresses:
             try:
-                response = requests.post(f"{address}/notify_finish_update_grad" , json={'address': self.my_address})
+                response = requests.post(f"{address}/notify_finish" , json={'address': self.my_address, 'description': description})
             except Exception as e:
                 print(e)
                 print(f"Error: could not connect to {address}")
                 continue
     
-    def wait_till_finish_update_grad(self):
+    def wait_till_finish(self, count=None, description="initialize"):
         # wait everyone to finish
-        while self.num_finish_update_grad < len(self.all_addresses): # exclude the current machine
-            print(f"Waiting for machines to finish... currently {self.num_finish_update_grad + 1}/{len(self.all_addresses) + 1}")
+        if count is None:
+            count = len(self.all_addresses)
+        while self.num_finish[description] < count: # exclude the current machine
+            print(f"Waiting for machines to finish {description}... currently {self.num_finish[description] + 1}/{len(self.all_addresses) + 1}")
             time.sleep(0.1)
-        self.num_finish_update_grad = 0
+        self.num_finish[description] = 0
+    
+    def sync(self, description="initialize", count=None):
+        if count is None:
+            count = len(self.all_addresses)
+        self.notify_finish(description)
+        self.wait_till_finish(count, description)
 
 
     def run(self):
-        self.announce_existence()
         num_joined = 0
+        self.announce_existence()
         if not self.all_addresses:
             print("No other machines found.")
             self.initialize_run()
         if self.model is None:
             print("Model not initialized.")
             self.initialize_model()
-        while len(self.all_addresses) + 1 < self.min_num_machines: # +1 to include the current machine
-            if len(self.all_addresses) + 1 > num_joined:
-                num_joined = len(self.all_addresses) + 1
-                print(f"Waiting for machines to join... currently {len(self.all_addresses) + 1}/{self.min_num_machines}")
-            time.sleep(0.1) # sleep for a while before checking again
-            # if time.time() > self.end_time - self.buffer_time - self.inference_time:
-            #     self.end_time += self.increment_time
-        initialization_time = time.time() + 20
-        while time.time() < initialization_time:
-            time.sleep(0.1)  # make sure all machines have time to initialize
+        
+        self.sync("finish initialize model", max(self.min_num_machines, len(self.all_addresses)))
 
-        # while time.time() > self.end_time - self.buffer_time - self.inference_time:
-        #     self.end_time += self.increment_time
-        # print("Starting with end time", self.end_time)
+        # while len(self.all_addresses) + 1 < self.min_num_machines: # +1 to include the current machine
+        #     if len(self.all_addresses) + 1 > num_joined:
+        #         num_joined = len(self.all_addresses) + 1
+        #         print(f"Waiting for machines to join... currently {len(self.all_addresses) + 1}/{self.min_num_machines}")
+        #     time.sleep(0.1) # sleep for a while before checking again
+        # initialization_time = time.time() + 20
+        # while time.time() < initialization_time:
+        #     time.sleep(0.1)  # make sure all machines have time to initialize)
 
-        while True:  # Run the training loop
+        while self.total_iterations < self.max_iterations:  # Run the training loop
             with torch.inference_mode(mode = not self.normal):
                 print("Starting run.")
                 self.announce_existence()
@@ -376,8 +394,7 @@ class Machine:
                 print("Calculating losses.")
                 self.update_weights()
 
-                self.notify_finish_update_grad()
-                self.wait_till_finish_update_grad()
+                self.sync("finish forward pass")
 
                 if self.use_backup:
                     print("Restoring weights.")
@@ -387,8 +404,7 @@ class Machine:
                 print("Applying gradients.")
                 self.apply_all_grads(all_projected_grads)
 
-                self.notify_finish_update_grad()
-                self.wait_till_finish_update_grad()
+                self.sync("finish applying gradients")
 
                 print("Finished training for this round ending at", time.time())
                 if self.all_addresses:  # Choose a random address to check the hash
@@ -397,7 +413,7 @@ class Machine:
                 # self.end_time += self.increment_time
 
 def calculate_loss(model, tokenizer, batch):
-    tokenized_batch = tokenizer(batch, return_tensors='pt', padding=True, truncation=True)
+    tokenized_batch = tokenizer(batch, return_tensors='pt', padding=True, truncation=True, return_token_type_ids=False if "llama" in tokenizer.name_or_path else None)
     device = next(model.parameters()).device
     tokenized_batch = {k: v.to(device) for k, v in tokenized_batch.items()}
     outputs = model(**tokenized_batch, labels=tokenized_batch["input_ids"])
