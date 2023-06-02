@@ -1,7 +1,7 @@
 import numpy as np
 import time
 import requests
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, LlamaTokenizer
 from datasets import load_dataset
 from argparse import ArgumentParser
 import torch
@@ -49,7 +49,10 @@ class Machine:
         self.addresses_timestamp = {self.my_address: self.timestamp}  # Timestamps of all known servers
         self.dataset = load_dataset(*self.dataset_name)['train']  # Initialize the dataset
         self.model_name = model_name  # Name of the model to be used
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)  # Tokenizer for the model
+        if "llama" in model_name:
+            self.tokenizer = LlamaTokenizer.from_pretrained(model_name)
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)  # Tokenizer for the model
         if self.tokenizer.pad_token is None:  # Add a padding token if there isn't one - common
             self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         self.perturbed = False  # Whether the model has been perturbed (flag to prevent sending weights while perturbed)
@@ -259,7 +262,7 @@ class Machine:
         # Write mean loss to loss.txt
         model_name = self.model_name.split('/')[-1]
         with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}.txt', 'a+') as f:
-            f.write(self.my_address+": " + str(np.mean(self.losses)) + " start inference time: " + str(start_round_time - self.timestamp)  +" finish inference time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + '\n')
+            f.write(self.my_address+": " + str(np.mean(self.losses)) + " start inference time: " + str(start_round_time - self.timestamp)  +" finish inference time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + " num samples: " + str(self.sample_number) + '\n')
 
     def request_grads_from_all_machines(self):
         all_projected_grads = {
@@ -308,7 +311,7 @@ class Machine:
         self.perturbed = False
         model_name = self.model_name.split('/')[-1]
         with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}.txt', 'a+') as f:
-            f.write(self.my_address+": " + str(np.mean(self.losses)) + " start grad time: " + str(start_round_time - self.timestamp)  +" finish grad time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + '\n')
+            f.write(self.my_address+": " + str(np.mean(self.losses)) + " start grad time: " + str(start_round_time - self.timestamp)  +" finish grad time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + " num samples: " + str(num_samples) + '\n')
 
     def notify_finish(self, description="initialize"):
         for address in self.all_addresses:
@@ -364,11 +367,12 @@ class Machine:
                 all_projected_grads = self.request_grads_from_all_machines()
                 print("Applying gradients.")
                 self.apply_all_grads(all_projected_grads)
+                self.total_iterations += 1
                 self.sync("finish applying gradients")
-                print("Finished training for this round ending at", time.time())
+                print(f"Finished training for iteration {self.total_iterations} ending at", time.time())
                 if self.all_addresses:  # Choose a random address to check the hash
                     self.model = confirm_hash(np.random.choice(self.all_addresses), self.model)
-                self.total_iterations += 1
+                
 
 def calculate_loss(model, tokenizer, batch):
     tokenized_batch = tokenizer(batch, return_tensors='pt', padding=True, truncation=True, return_token_type_ids=False if "llama" in tokenizer.name_or_path else None)
@@ -442,7 +446,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_name', type=str, default='gpt2')
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--epsilon', type=float, default=1e-3)
-    parser.add_argument('--increment_time', type=float, default=30)
+    parser.add_argument('--increment_time', type=float, default=1000)
     parser.add_argument('--learning_rate', type=float, default=1e-1)
     parser.add_argument('--gradient_acc_steps', type=float, default=30)
     parser.add_argument('--buffer_time', type=float, default=0)
