@@ -1,7 +1,7 @@
 import numpy as np
 import time
 import requests
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, LlamaTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from datasets import load_dataset
 from argparse import ArgumentParser
 import torch
@@ -10,6 +10,10 @@ from flask import Flask, request, send_file, Response
 from threading import Thread
 import hashlib
 import pickle
+from flax.core.frozen_dict import freeze, unfreeze
+import jax
+import jax.numpy as jnp
+import jax.nn
 
 class Machine:
     def __init__(self, my_address, initial_server_addresses,
@@ -18,14 +22,21 @@ class Machine:
                 model_name='gpt2', dataset_name=('gsm8k', 'main'), dataset_index='question',
                 device='best', dtype=torch.float16, use_lora=False, min_num_machines=2, send_full_grad=False,
                 normal=False, use_different_gpu=False, debug=False, gradient_acc_steps=1, learning_rate=1e-1,
+                backend='pt'
         ):
+        self.backend = backend
+        self.add_perturbation = self.add_perturbation_jax if self.backend == 'jax' else self.add_perturbation_torch
         self.my_address = my_address
         self.dataset_name = dataset_name  # Name of the dataset to be used
         self.dataset_index = dataset_index  # Index of the dataset to be used
         self.buffer_time = buffer_time  # Time to stop inferencing before end_time
         self.epsilon = epsilon  # Perturbation size
         if device == 'best':
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            if backend != 'jax':
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            else:
+                import jax
+                device = jax.devices('gpu')[0]
         self.device = device  # Device to run model on
         self.model = None  # Model to be trained
         self.dtype = dtype  # Data type to use for training
@@ -49,10 +60,7 @@ class Machine:
         self.addresses_timestamp = {self.my_address: self.timestamp}  # Timestamps of all known servers
         self.dataset = load_dataset(*self.dataset_name)['train']  # Initialize the dataset
         self.model_name = model_name  # Name of the model to be used
-        if "llama" in model_name:
-            self.tokenizer = LlamaTokenizer.from_pretrained(model_name)
-        else:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)  # Tokenizer for the model
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)  # Tokenizer for the model
         if self.tokenizer.pad_token is None:  # Add a padding token if there isn't one - common
             self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         self.perturbed = False  # Whether the model has been perturbed (flag to prevent sending weights while perturbed)
@@ -136,9 +144,15 @@ class Machine:
     def initialize_model(self, use_default=False):
         if use_default or self.total_iterations == 0:
             print("Initializing default model")
+            if self.backend == 'jax':
+                from transformers import FlaxAutoModelForCausalLM as AutoModelForCausalLM
+            else:
+                from transformers import AutoModelForCausalLM
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_name
-            ).eval()
+            )
+            if self.backend != 'jax':
+                self.model.eval()
         else:
             random_address = np.random.choice(self.all_addresses)
             print("Getting model from", random_address)
@@ -149,13 +163,14 @@ class Machine:
             # Load from pretrained config
             config = AutoConfig.from_pretrained(self.model_name)
             self.model = AutoModelForCausalLM.from_config(config).eval()
+        resize_token_embeddings = resize_token_embeddings_jax if self.backend == 'jax' else resize_token_embeddings_torch
         resize_token_embeddings(self.model, len(self.tokenizer))
         if not use_default and self.total_iterations != 0:
             self.model.load_state_dict(torch.load('received_model.pt'))
             print("Loaded model from", random_address)
         if self.model.config.pad_token_id == -1:
             self.model.config.pad_token_id = self.tokenizer.pad_token_id
-        self.model = model_processing(self.model, self.dtype, self.device, self.use_lora)
+        self.model = model_processing(self.model, self.dtype, self.device, self.use_lora, self.backend)
 
     ### Server functions ###
     def start_server(self, port):
@@ -182,8 +197,20 @@ class Machine:
             self.total_iterations = response['total_iterations']
 
     ### Training functions ###
-    def add_perturbation(self, scaling_factor, timestamp, sample_number, debug=False):
-        set_seed(self.total_iterations, timestamp - self.min_machine_timestamp, sample_number)
+    def add_perturbation_jax(self, scaling_factor, timestamp, sample_number, debug=False):
+        self.key = set_seed_jax(self.total_iterations, timestamp - self.min_machine_timestamp, sample_number)
+        self.inferenced = False
+        def add_noise(param):
+            self.key, subkey = jax.random.split(self.key)
+            noise = jax.random.normal(subkey, param.shape)
+            if not self.inferenced:
+                print(noise.ravel()[-1])
+                self.inferenced = True
+            return param + noise * self.epsilon * scaling_factor
+        self.model.params = jax.tree_map(add_noise, self.model.params)
+
+    def add_perturbation_torch(self, scaling_factor, timestamp, sample_number, debug=False):
+        set_seed_torch(self.total_iterations, timestamp - self.min_machine_timestamp, sample_number)
         for param_name, param in self.model.named_parameters():
             if self.use_lora and 'lora' not in param_name:
                 continue
@@ -202,7 +229,7 @@ class Machine:
             self.grad[param_name] = param.grad.data.clone()
 
     def accumulate_grad(self, scaling_factor, timestamp, sample_number):
-        set_seed(self.total_iterations, timestamp - self.min_machine_timestamp, sample_number)
+        set_seed_torch(self.total_iterations, timestamp - self.min_machine_timestamp, sample_number)
         for param_name, param in self.model.named_parameters():
             if self.use_lora and 'lora' not in param_name:
                 continue
@@ -234,12 +261,13 @@ class Machine:
             batch = get_batch(self.batch_size, self.dataset, self.dataset_index)
             if self.normal:
                 self.grad["num_samples"] += 1
-                loss = calculate_loss(self.model, self.tokenizer, batch)
+                loss = calculate_loss_torch(self.model, self.tokenizer, batch)
                 loss.backward()
                 self.losses.append(loss.item())
                 print(f"Projected gradient: disabled  - time elapsed: {time.time() - init_time}, loss = {loss.item()}")
             else:
                 self.perturbed = True
+                calculate_loss = calculate_loss_jax if self.backend == "jax" else calculate_loss_torch
                 self.add_perturbation(1, self.timestamp, self.sample_number)
                 loss_1 = calculate_loss(self.model, self.tokenizer, batch).item()
                 self.add_perturbation(-2, self.timestamp, self.sample_number)
@@ -262,7 +290,7 @@ class Machine:
         # Write mean loss to loss.txt
         model_name = self.model_name.split('/')[-1]
         with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}.txt', 'a+') as f:
-            f.write(self.my_address+": " + str(np.mean(self.losses)) + " start inference time: " + str(start_round_time - self.timestamp)  +" finish inference time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + " num samples: " + str(self.sample_number) + '\n')
+            f.write(self.my_address+": " + str(np.mean(self.losses)) + " start inference time: " + str(start_round_time - self.timestamp)  +" finish inference time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + '\n')
 
     def request_grads_from_all_machines(self):
         all_projected_grads = {
@@ -311,7 +339,7 @@ class Machine:
         self.perturbed = False
         model_name = self.model_name.split('/')[-1]
         with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}.txt', 'a+') as f:
-            f.write(self.my_address+": " + str(np.mean(self.losses)) + " start grad time: " + str(start_round_time - self.timestamp)  +" finish grad time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + " num samples: " + str(num_samples) + '\n')
+            f.write(self.my_address+": " + str(np.mean(self.losses)) + " start grad time: " + str(start_round_time - self.timestamp)  +" finish grad time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + '\n')
 
     def notify_finish(self, description="initialize"):
         for address in self.all_addresses:
@@ -356,25 +384,47 @@ class Machine:
                     self.initialize_model()
                 if self.use_backup:
                     print("Backing up weights.")
-                    self.backup_weights = {k: v.cpu() for k, v in self.model.state_dict().items()}
+                    if self.backend == 'jax':
+                        self.backup_weights = jax.device_put(self.model.params, device=jax.devices('cpu')[0])
+                    else:
+                        self.backup_weights = {k: v.cpu() for k, v in self.model.state_dict().items()}
                 print("Calculating losses.")
                 self.update_weights()
                 self.sync("finish forward pass")
                 if self.use_backup:
                     print("Restoring weights.")
-                    self.model.load_state_dict(self.backup_weights)
+                    if self.backend == 'jax':
+                        gpu_devices = [device for device in jax.devices() if 'gpu' in str(device).lower()]
+                        self.model.params = jax.device_put(self.backup_weights, device=gpu_devices[0])
+                    else:
+                        self.model.load_state_dict(self.backup_weights)
                 print("Requesting gradients.")
                 all_projected_grads = self.request_grads_from_all_machines()
                 print("Applying gradients.")
                 self.apply_all_grads(all_projected_grads)
-                self.total_iterations += 1
                 self.sync("finish applying gradients")
-                print(f"Finished training for iteration {self.total_iterations} ending at", time.time())
+                print("Finished training for this round ending at", time.time())
                 if self.all_addresses:  # Choose a random address to check the hash
                     self.model = confirm_hash(np.random.choice(self.all_addresses), self.model)
-                
+                self.total_iterations += 1
 
-def calculate_loss(model, tokenizer, batch):
+def compute_loss(logits, labels):
+    ignore_index = -100
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    log_probs = jnp.take_along_axis(log_probs, labels[..., None], axis=-1).squeeze(-1)
+    loss = jnp.where(labels != ignore_index, log_probs, 0)
+    loss = -jnp.sum(loss) / jnp.sum(labels != ignore_index)
+    return loss
+
+def calculate_loss_jax(model, tokenizer, batch):
+    tokenized_batch = tokenizer(batch, padding=True, truncation=True, return_token_type_ids=False if "llama" in tokenizer.name_or_path else None, return_tensors='np')
+    outputs = model(**tokenized_batch)
+    logits = outputs.logits
+    labels = tokenized_batch["input_ids"]
+    loss = compute_loss(logits, labels)
+    return loss
+
+def calculate_loss_torch(model, tokenizer, batch):
     tokenized_batch = tokenizer(batch, return_tensors='pt', padding=True, truncation=True, return_token_type_ids=False if "llama" in tokenizer.name_or_path else None)
     device = next(model.parameters()).device
     tokenized_batch = {k: v.to(device) for k, v in tokenized_batch.items()}
@@ -392,10 +442,11 @@ def get_batch(batch_size, dataset, dataset_index):
         return get_batch(batch_size, dataset, dataset_index)
     return batch
 
-def model_processing(model, dtype, device, use_lora):
-    model.to(dtype)  # Process a model after loading it
-    model.eval()
-    model.to(device)
+def model_processing(model, dtype, device, use_lora, backend='pt'):
+    if backend != 'jax':
+        model.to(dtype)  # Process a model after loading it
+        model.eval()
+        model.to(device)
     if use_lora:
         from peft import get_peft_model, LoraConfig, TaskType
         peft_config = LoraConfig(
@@ -404,13 +455,36 @@ def model_processing(model, dtype, device, use_lora):
         model = get_peft_model(model, peft_config)
     return model
 
-def set_seed(total_iterations, timestamp, sample_number):
+def set_seed_jax(total_iterations, timestamp, sample_number):
+    timer = int(f'{timestamp:.6f}'.replace('.', ''))
+    # Handle C-long overflow
+    full_seed = int(f'{total_iterations}{sample_number:03}{timer}') % 9223372036854775806
+    return jax.random.PRNGKey(full_seed)
+
+def set_seed_torch(total_iterations, timestamp, sample_number):
     timer = int(f'{timestamp:.6f}'.replace('.', ''))
     full_seed = int(f'{total_iterations}{sample_number:05}{timer}') % 9223372036854775806
     torch.manual_seed(full_seed)
     torch.cuda.manual_seed(full_seed)
 
-def resize_token_embeddings(model, new_size):
+def resize_token_embeddings_jax(model, new_size):
+    if model.config.vocab_size == new_size:
+        return
+    model.config.vocab_size = new_size
+    params = model.params
+    rnd_key = jax.random.PRNGKey(0)
+    params = unfreeze(params)
+    old_embeddings = params['transformer']['wte']['embedding']
+    old_size = old_embeddings.shape[0]
+    dim = old_embeddings.shape[1]
+    initializer = jax.nn.initializers.normal(stddev=model.config.initializer_range)
+    new_embeddings = initializer(rnd_key, (new_size, dim))
+    new_embeddings = new_embeddings.at[:old_size].set(old_embeddings)
+    params['transformer']['wte']['embedding'] = new_embeddings
+    params = freeze(params)
+    model.params = params
+
+def resize_token_embeddings_torch(model, new_size):
     cur_seed = torch.seed()
     torch.manual_seed(0)  # For reproducibility
     model.resize_token_embeddings(new_size)
@@ -446,7 +520,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_name', type=str, default='gpt2')
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--epsilon', type=float, default=1e-3)
-    parser.add_argument('--increment_time', type=float, default=1000)
+    parser.add_argument('--increment_time', type=float, default=30)
     parser.add_argument('--learning_rate', type=float, default=1e-1)
     parser.add_argument('--gradient_acc_steps', type=float, default=30)
     parser.add_argument('--buffer_time', type=float, default=0)
