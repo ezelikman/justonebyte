@@ -349,7 +349,7 @@ class Machine:
         if count is None:
             count = len(self.all_addresses)
         while self.num_finish[description] < count: # exclude the current machine
-            print(f"Waiting for machines to finish {description}... currently {self.num_finish[description] + 1}/{len(self.all_addresses) + 1}")
+            print(f"Waiting for machines to {description}... currently {self.num_finish[description] + 1}/{count + 1}")
             time.sleep(0.1)
         self.num_finish[description] = 0
     
@@ -370,7 +370,7 @@ class Machine:
             print("Model not initialized.")
             self.initialize_model()
         
-        self.sync("finish initialize model", max(self.min_num_machines, len(self.all_addresses)))
+        self.sync("finish initialize model", max(self.min_num_machines-1, len(self.all_addresses)))
 
         # while len(self.all_addresses) + 1 < self.min_num_machines: # +1 to include the current machine
         #     if len(self.all_addresses) + 1 > num_joined:
