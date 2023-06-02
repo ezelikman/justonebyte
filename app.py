@@ -6,12 +6,10 @@ from datasets import load_dataset
 from argparse import ArgumentParser
 import torch
 torch.use_deterministic_algorithms(True)
-from flask import Flask, request, send_file
+from flask import Flask, request, send_file, Response
 from threading import Thread
 import hashlib
-from peft import get_peft_model, LoraConfig, TaskType
 import pickle
-from flask import Response
 
 class Machine:
     def __init__(self, my_address, initial_server_addresses,
@@ -395,6 +393,7 @@ def model_processing(model, dtype, device, use_lora):
     model.eval()
     model.to(device)
     if use_lora:
+        from peft import get_peft_model, LoraConfig, TaskType
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM, inference_mode=True, r=8, lora_alpha=32, lora_dropout=0.0
         )
