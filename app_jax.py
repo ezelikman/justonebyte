@@ -22,7 +22,7 @@ class Machine:
                 model_name='gpt2', dataset_name=('gsm8k', 'main'), dataset_index='question',
                 device='best', dtype=torch.float16, use_lora=False, min_num_machines=2, send_full_grad=False,
                 normal=False, use_different_gpu=False, debug=False, gradient_acc_steps=1, learning_rate=1e-1,
-                backend='jax'
+                backend='pt'
         ):
         self.backend = backend
         self.add_perturbation = self.add_perturbation_jax if self.backend == 'jax' else self.add_perturbation_torch
@@ -32,9 +32,9 @@ class Machine:
         self.buffer_time = buffer_time  # Time to stop inferencing before end_time
         self.epsilon = epsilon  # Perturbation size
         if device == 'best':
-            if backend == 'pt':
+            if backend != 'jax':
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            elif backend == 'jax':
+            else:
                 import jax
                 device = jax.devices('gpu')[0]
         self.device = device  # Device to run model on
@@ -146,6 +146,8 @@ class Machine:
             print("Initializing default model")
             if self.backend == 'jax':
                 from transformers import FlaxAutoModelForCausalLM as AutoModelForCausalLM
+            else:
+                from transformers import AutoModelForCausalLM
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_name
             )
@@ -461,7 +463,7 @@ def set_seed_jax(total_iterations, timestamp, sample_number):
 
 def set_seed_torch(total_iterations, timestamp, sample_number):
     timer = int(f'{timestamp:.6f}'.replace('.', ''))
-    full_seed = int(f'{total_iterations}{sample_number:05}{timer}')
+    full_seed = int(f'{total_iterations}{sample_number:05}{timer}') % 9223372036854775806
     torch.manual_seed(full_seed)
     torch.cuda.manual_seed(full_seed)
 
