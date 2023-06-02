@@ -18,7 +18,8 @@ class Machine:
                 increment_time, buffer_time, inference_time,
                 epsilon=0.001, batch_size=16, use_backup=True,
                 model_name='gpt2', dataset_name=('gsm8k', 'main'), dataset_index='question',
-                device='best', dtype=torch.float16, use_lora=False, min_num_machines=2, send_full_grad=False, normal=False, use_different_gpu=False, debug=False, gradient_acc_steps=1, learning_rate=1e-1
+                device='best', dtype=torch.float16, use_lora=False, min_num_machines=2, send_full_grad=False,
+                normal=False, use_different_gpu=False, debug=False, gradient_acc_steps=1, learning_rate=1e-1,
         ):
         self.my_address = my_address
         self.dataset_name = dataset_name  # Name of the dataset to be used
@@ -179,16 +180,11 @@ class Machine:
                 if addr not in self.all_addresses and addr != self.my_address:
                     self.all_addresses.append(addr)
             self.addresses_timestamp.update(response['timestamps'])
-            # if self.end_time is None:
-            #     self.end_time = response['end_time']
             self.learning_rate = response['learning_rate']
             self.total_iterations = response['total_iterations']
 
     ### Training functions ###
     def add_perturbation(self, scaling_factor, timestamp, sample_number, debug=False):
-        # set_seed(self.end_time, timestamp, sample_number)
-        # torch.cuda.synchronize()
-        # s = time.time()
         set_seed(self.total_iterations, sample_number)
         for param_name, param in self.model.named_parameters():
             if self.use_lora and 'lora' not in param_name:
@@ -200,7 +196,6 @@ class Machine:
             else:
                 z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
             param.data = param.data + scaling_factor * z * self.epsilon
-        # print(f"Time to add perturbation: {time.time() - s}")
            
     def get_model_grad(self):
         for param_name, param in self.model.named_parameters():
@@ -209,7 +204,6 @@ class Machine:
             self.grad[param_name] = param.grad.data.clone()
             
     def accumulate_grad(self, scaling_factor, timestamp, sample_number):
-        # set_seed(self.end_time, timestamp, sample_number)
         set_seed(self.total_iterations, sample_number)
         for param_name, param in self.model.named_parameters():
             if self.use_lora and 'lora' not in param_name:
@@ -235,7 +229,6 @@ class Machine:
         if self.normal:
             self.model.zero_grad()
         start_round_time = time.time()
-        # while time.time() < self.end_time - self.buffer_time - self.inference_time:
         while self.sample_number < self.gradient_acc_steps and  (time.time() - start_round_time) < self.increment_time:
             init_time = time.time()
             print(f"Sample number: {self.sample_number} - inference time remaining: {self.increment_time + start_round_time - time.time() }")
@@ -270,8 +263,6 @@ class Machine:
             if time.time() - init_time > self.inference_time:
                 print("Warning: updating preset inference time to the actual inference time.")
                 self.inference_time = time.time() - init_time
-            #     if self.buffer_time < self.inference_time:
-            #         self.buffer_time = self.inference_time
             self.sample_number += 1
 
         if self.sample_number < self.gradient_acc_steps:
@@ -280,8 +271,6 @@ class Machine:
         model_name = self.model_name.split('/')[-1]
         with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.addresses_timestamp[self.main_machine_address]}.txt', 'a+') as f:
             f.write(self.my_address+": " + str(np.mean(self.losses)) + " start inference time: " + str(start_round_time - self.timestamp)  +" finish inference time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + '\n')
-        # while time.time() < self.end_time - self.buffer_time:
-        #     time.sleep(0.1)
 
     def request_grads_from_all_machines(self):
         all_projected_grads = {
@@ -307,7 +296,6 @@ class Machine:
         return all_projected_grads
 
     def apply_all_grads(self, all_projected_grads):
-        
         while self.sending_weights:
             time.sleep(0.1)
         start_round_time = time.time()
@@ -333,8 +321,7 @@ class Machine:
         model_name = self.model_name.split('/')[-1]
         with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.addresses_timestamp[self.main_machine_address]}.txt', 'a+') as f:
             f.write(self.my_address+": " + str(np.mean(self.losses)) + " start grad time: " + str(start_round_time - self.timestamp)  +" finish grad time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + '\n')
-        
-        
+
     def notify_finish(self, description="initialize"):
         for address in self.all_addresses:
             try:
@@ -343,22 +330,21 @@ class Machine:
                 print(e)
                 print(f"Error: could not connect to {address}")
                 continue
-    
+
     def wait_till_finish(self, count=None, description="initialize"):
-        # wait everyone to finish
+        # wait for everyone to finish
         if count is None:
             count = len(self.all_addresses)
         while self.num_finish[description] < count: # exclude the current machine
             print(f"Waiting for machines to {description}... currently {self.num_finish[description] + 1}/{count + 1}")
             time.sleep(0.1)
         self.num_finish[description] = 0
-    
+
     def sync(self, description="initialize", count=None):
         if count is None:
             count = len(self.all_addresses)
         self.notify_finish(description)
         self.wait_till_finish(count, description)
-
 
     def run(self):
         num_joined = 0
@@ -369,17 +355,8 @@ class Machine:
         if self.model is None:
             print("Model not initialized.")
             self.initialize_model()
-        
-        self.sync("finish initialize model", max(self.min_num_machines-1, len(self.all_addresses)))
 
-        # while len(self.all_addresses) + 1 < self.min_num_machines: # +1 to include the current machine
-        #     if len(self.all_addresses) + 1 > num_joined:
-        #         num_joined = len(self.all_addresses) + 1
-        #         print(f"Waiting for machines to join... currently {len(self.all_addresses) + 1}/{self.min_num_machines}")
-        #     time.sleep(0.1) # sleep for a while before checking again
-        # initialization_time = time.time() + 20
-        # while time.time() < initialization_time:
-        #     time.sleep(0.1)  # make sure all machines have time to initialize)
+        self.sync("finish initialize model", max(self.min_num_machines-1, len(self.all_addresses)))
 
         while self.total_iterations < self.max_iterations:  # Run the training loop
             with torch.inference_mode(mode = not self.normal):
@@ -410,7 +387,6 @@ class Machine:
                 if self.all_addresses:  # Choose a random address to check the hash
                     self.model = confirm_hash(np.random.choice(self.all_addresses), self.model)
                 self.total_iterations += 1
-                # self.end_time += self.increment_time
 
 def calculate_loss(model, tokenizer, batch):
     tokenized_batch = tokenizer(batch, return_tensors='pt', padding=True, truncation=True, return_token_type_ids=False if "llama" in tokenizer.name_or_path else None)
@@ -441,15 +417,9 @@ def model_processing(model, dtype, device, use_lora):
         model = get_peft_model(model, peft_config)
     return model
 
-# def set_seed(end_time, timestamp, sample_number):
-    # print(f"end_time: {end_time}, timestamp: {timestamp}, sample_number: {sample_number}")
-    # diff_time = abs(end_time - timestamp) # Convert timestamps to 32-bit integer
-    # timer = format(diff_time, '.8f').replace('.', '')
-def set_seed(total_iterations, sample_number):
-    timer = str(total_iterations)
-    full_seed = int(timer + str(sample_number))  # Sample number is already an int
-    # print(f"Setting seed to {full_seed}")
-    # np.random.seed(full_seed)
+def set_seed(total_iterations, sample_number, max_samples_per_iteration_per_device=100_000):
+    full_seed = total_iterations * max_samples_per_iteration_per_device + sample_number
+    timer = int(f'{total_iterations}{sample_number:06}')
     torch.manual_seed(full_seed)
     torch.cuda.manual_seed(full_seed)
 
