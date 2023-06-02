@@ -10,13 +10,15 @@ from flask import Flask, request, send_file
 from threading import Thread
 import hashlib
 from peft import get_peft_model, LoraConfig, TaskType
+import pickle
+from flask import Response
 
 class Machine:
     def __init__(self, my_address, initial_server_addresses,
                 increment_time, buffer_time, inference_time,
                 epsilon=0.001, batch_size=16, use_backup=True,
                 model_name='gpt2', dataset_name=('gsm8k', 'main'), dataset_index='question',
-                device='best', dtype=torch.float16, use_lora=False, min_num_machines=2,
+                device='best', dtype=torch.float16, use_lora=False, min_num_machines=2, send_full_grad=False, normal=False, use_differnt_gpu=False, debug=False, gradient_acc_steps=1
         ):
         self.my_address = my_address
         self.dataset_name = dataset_name  # Name of the dataset to be used
@@ -30,13 +32,18 @@ class Machine:
         self.dtype = dtype  # Data type to use for training
         self.use_lora = use_lora  # Whether to use LoRA
         self.timestamp = time.time()  # Timestamp used to identify this machine
+
         self.sample_number = 0  # Number of samples seen so far - reset with each increment
         self.batch_size = batch_size  # Batch size for training
         self.end_time = None  # End of the current increment
         self.increment_time = increment_time  # Length of each increment
         self.projected_grads = []  # Projected gradients for each increment
+        self.grad = {}
+        self.send_full_grad = send_full_grad
+        self.normal=normal
         self.inference_time = inference_time  # Time per inference, should be an upper bound
         self.all_addresses = initial_server_addresses  # Addresses of all known servers
+        self.main_machine_address = self.all_addresses[0]  # Address of the main machine
         self.min_num_machines = min_num_machines  # Minimum number of machines to train with
         if my_address in self.all_addresses:
             self.all_addresses.remove(my_address)
@@ -52,6 +59,10 @@ class Machine:
         self.use_backup = use_backup
         self.backup_weights = None
         self.total_iterations = 0
+        self.num_finish_update_grad = 0
+        self.use_differnt_gpu = use_differnt_gpu
+        self.debug = debug
+        self.gradient_acc_steps=gradient_acc_steps
         self.app = Flask(__name__)
 
         @self.app.route('/model', methods=['GET'])
@@ -71,16 +82,31 @@ class Machine:
         
         @self.app.route('/hash', methods=['GET'])
         def get_hash():
-            while (time.time() < self.end_time - self.buffer_time) or self.perturbed:
+            # while (time.time() < self.end_time - self.buffer_time) or self.perturbed:
+            #     time.sleep(0.1)
+            while self.perturbed:
                 time.sleep(0.1)
             return {'hash': calculate_hash(self.model)}
 
         @self.app.route('/grads', methods=['GET'])
         def get_grads():
             if self.model is not None:
-                return {'grads': self.projected_grads}
+                if self.send_full_grad or self.normal :
+                    # torch.save(self.grad, 'tmp_grad.pt')
+                    # print("start sending grad")
+                    # return send_file('tmp_grad.pt', as_attachment=True)
+                    if self.normal:
+                        self.grad = self.get_grad(self.model)
+                    return Response(pickle.dumps(self.grad), mimetype='application/octet-stream')
+                else:
+                    return {'grads': self.projected_grads}
             else:
                 return {'error': 'Model not initialized'}, 500
+        
+        @self.app.route('/notify_finish_update_grad', methods=['POST'])
+        def update_num_finish_update_grad():
+            self.num_finish_update_grad += 1
+            return {'num_finish_update_grad': self.num_finish_update_grad}
 
         @self.app.route('/notify', methods=['POST'])
         def notify_new_server():
@@ -102,7 +128,7 @@ class Machine:
     ### Initialization functions ###
     def initialize_run(self):
         self.initialize_model()
-        self.end_time = time.time() + self.increment_time
+        # self.end_time = time.time() + self.increment_time
         self.learning_rate = 1e-1
 
     def initialize_model(self, use_default=False):
@@ -131,7 +157,7 @@ class Machine:
 
     ### Server functions ###
     def start_server(self, port):
-        self.app.run(port=port)
+        self.app.run(host="0.0.0.0", port=port)
 
     def announce_existence(self):
         for address in self.all_addresses:
@@ -144,82 +170,176 @@ class Machine:
                 if addr not in self.all_addresses and addr != self.my_address:
                     self.all_addresses.append(addr)
             self.addresses_timestamp.update(response['timestamps'])
-            if self.end_time is None:
-                self.end_time = response['end_time']
+            # if self.end_time is None:
+            #     self.end_time = response['end_time']
             self.learning_rate = response['learning_rate']
             self.total_iterations = response['total_iterations']
 
     ### Training functions ###
-    def add_perturbation(self, scaling_factor, timestamp, sample_number):
-        set_seed(self.end_time, timestamp, sample_number)
+    def add_perturbation(self, scaling_factor, timestamp, sample_number, debug=False):
+        # set_seed(self.end_time, timestamp, sample_number)
+        set_seed(self.total_iterations, sample_number)
+        for param_name, param in self.model.named_parameters():
+            if self.use_lora and 'lora' not in param_name:
+                continue
+            if debug:
+                breakpoint()
+            if self.use_differnt_gpu:
+                z = torch.normal(mean=0, std=1, size=param.data.size(), dtype=param.data.dtype).to(param.data.device)
+            else:
+                z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            param.data = param.data + scaling_factor * z * self.epsilon
+           
+    def get_model_grad(self):
+        for param_name, param in self.model.named_parameters():
+            if self.use_lora and 'lora' not in param_name:
+                continue
+            self.grad[param_name] = param.grad.data.clone()
+            
+    def accumulate_grad(self, scaling_factor, timestamp, sample_number):
+        # set_seed(self.end_time, timestamp, sample_number)
+        set_seed(self.total_iterations, sample_number)
         for param_name, param in self.model.named_parameters():
             if self.use_lora and 'lora' not in param_name:
                 continue
             z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
-            param.data = param.data + scaling_factor * z * self.epsilon
+            if param_name not in self.grad:
+                self.grad[param_name] = z * self.epsilon
+            else:
+                self.grad[param_name] += z * self.epsilon
+    
+    def apply_full_grad(self, scaling_factor, grad):
+        for param_name, param in self.model.named_parameters():
+            if self.use_lora and 'lora' not in param_name:
+                continue
+            param.data = param.data + scaling_factor * grad[param_name]
+           
 
     def update_weights(self):
+        self.grad = {"num_samples": 0}
         self.projected_grads = []
         self.losses = []
         self.sample_number = 0
-        while time.time() < self.end_time - self.buffer_time - self.inference_time:
+        if self.normal:
+            self.model.zero_grad()
+        start_round_time = time.time()
+        # while time.time() < self.end_time - self.buffer_time - self.inference_time:
+        while self.sample_number < self.gradient_acc_steps and  (time.time() - start_round_time) < self.increment_time:
             init_time = time.time()
-            print(f"Sample number: {self.sample_number} - inference time remaining: {self.end_time - init_time - self.buffer_time - self.inference_time}")
+            print(f"Sample number: {self.sample_number} - inference time remaining: {self.increment_time + start_round_time - time.time() }")
             while self.sending_weights:
                 time.sleep(0.1)
             batch = get_batch(self.batch_size, self.dataset, self.dataset_index)
-            self.perturbed = True
-            self.add_perturbation(1, self.timestamp, self.sample_number)
-            loss_1 = calculate_loss(self.model, self.tokenizer, batch)
-            self.add_perturbation(-2, self.timestamp, self.sample_number)
-            loss_2 = calculate_loss(self.model, self.tokenizer, batch)
-            self.add_perturbation(1, self.timestamp, self.sample_number)
-            self.perturbed = False
-            self.projected_grads.append((loss_1 - loss_2) / (2 * self.epsilon))
-            self.losses.append((loss_1 + loss_2) / 2)
+            if self.normal:
+                self.grad["num_samples"] += 1
+                loss = calculate_loss(self.model, self.tokenizer, batch)
+                loss.backward()
+                # save to self.grad
+            else:
+                self.perturbed = True
+                # calculate_hash(self.model)
+                s = time.time()
+                self.add_perturbation(1, self.timestamp, self.sample_number)
+                print(f"Time to add perturbation: {time.time() - s}")
+                loss_1 = calculate_loss(self.model, self.tokenizer, batch)
+                self.add_perturbation(-2, self.timestamp, self.sample_number)
+                loss_2 = calculate_loss(self.model, self.tokenizer, batch)
+                self.add_perturbation(1, self.timestamp, self.sample_number)
+                self.perturbed = False
+                self.projected_grads.append((loss_1 - loss_2) / (2 * self.epsilon))
+                self.losses.append((loss_1 + loss_2) / 2)
+                if self.send_full_grad:
+                    self.grad["num_samples"] += 1
+                    self.accumulate_grad( self.projected_grads[-1], self.timestamp, self.sample_number)
+
             print(f"Projected gradient: {self.projected_grads[-1]} - time elapsed: {time.time() - init_time}, loss = {(loss_1 + loss_2) / 2}")
             # If the elapsed time is greater than the inference time, warn the user
             if time.time() - init_time > self.inference_time:
                 print("Warning: updating preset inference time to the actual inference time.")
                 self.inference_time = time.time() - init_time
+            #     if self.buffer_time < self.inference_time:
+            #         self.buffer_time = self.inference_time
             self.sample_number += 1
+
+        if self.sample_number < self.gradient_acc_steps:
+            print("Warning: did not have enough samples to reach desired gradients accumulation steps.")
         # Write mean loss to loss.txt
-        with open('loss.txt', 'a+') as f:
-            f.write(str(np.mean(self.losses)) + '\n')
-        while time.time() < self.end_time - self.buffer_time:
-            time.sleep(0.1)
+        with open(f'loss_send_full_grad={self.send_full_grad}_normal={self.normal}_{self.addresses_timestamp[self.main_machine_address]}.txt', 'a+') as f:
+            f.write(self.my_address+": " + str(np.mean(self.losses)) + " start inference time: " + str(start_round_time - self.timestamp)  +" finish inference time: " + str(time.time() - self.timestamp) + " num_samples: " + str(self.sample_number) + '\n')
+        # while time.time() < self.end_time - self.buffer_time:
+        #     time.sleep(0.1)
 
     def request_grads_from_all_machines(self):
         all_projected_grads = {
-            self.my_address: self.projected_grads
+            self.my_address: self.projected_grads if not (self.send_full_grad or self.normal) else self.grad
         }
         for address in self.all_addresses:
             try:
-                response = requests.get(f"{address}/grads").json()
-                if not 'grads' in response:
-                    print(f"Error: {response['error']}")
-                    continue
-            except:
+                if self.send_full_grad or self.normal:
+                    response = requests.get(f"{address}/grads")
+                    print("received grad")
+                    grad = pickle.loads(response.content)
+
+                else:
+                    response = requests.get(f"{address}/grads").json()
+                    if not 'grads' in response:
+                        print(f"Error: {response['error']}")
+                        continue
+                    grad = response['grads']
+            except Exception as e:
+                print(e)
                 print(f"Error: could not connect to {address}")
                 continue
-            all_projected_grads[address] = response['grads']
+            all_projected_grads[address] = grad
         return all_projected_grads
 
     def apply_all_grads(self, all_projected_grads):
+        
         while self.sending_weights:
             time.sleep(0.1)
+        start_round_time = time.time()
         self.perturbed = True
         # Get the sorted list of addresses
         sorted_addresses = sorted(all_projected_grads.keys(), key=lambda x: self.addresses_timestamp[x])
         # Calculate the number of samples
-        num_samples = sum([len(all_projected_grads[address]) for address in sorted_addresses])
-        for address in sorted_addresses:
-            address_grads = all_projected_grads[address]
-            for grad_idx, grad in enumerate(address_grads):
-                self.add_perturbation(
-                    -self.learning_rate * grad / num_samples,
-                    self.addresses_timestamp[address], grad_idx)
+        if self.send_full_grad or self.normal:
+            num_samples = sum([all_projected_grads[address]["num_samples"] for address in sorted_addresses])
+            for address in sorted_addresses:
+                self.apply_full_grad(-self.learning_rate / num_samples, all_projected_grads[address])
+        else:
+            num_samples = sum([len(all_projected_grads[address]) for address in sorted_addresses])
+            for address in sorted_addresses:
+                address_grads = all_projected_grads[address]
+                for grad_idx, grad in enumerate(address_grads):
+                    if self.debug:
+                        breakpoint()
+                    calculate_hash(self.model)
+                    s = time.time()
+                    self.add_perturbation(
+                        -self.learning_rate * grad / num_samples,
+                        self.addresses_timestamp[address], grad_idx, self.debug)
+                    print(f"Time to add perturbation: {time.time() - s}")
         self.perturbed = False
+        with open(f'loss_send_full_grad={self.send_full_grad}_normal={self.normal}_{self.addresses_timestamp[self.main_machine_address]}.txt', 'a+') as f:
+            f.write(self.my_address+": " + str(np.mean(self.losses)) + " start grad time: " + str(start_round_time - self.timestamp)  +" finish grad time: " + str(time.time() - self.timestamp) +  '\n')
+        
+        
+    def notify_finish_update_grad(self):
+        for address in self.all_addresses:
+            try:
+                response = requests.post(f"{address}/notify_finish_update_grad" , json={'address': self.my_address})
+            except Exception as e:
+                print(e)
+                print(f"Error: could not connect to {address}")
+                continue
+    
+    def wait_till_finish_update_grad(self):
+        # wait everyone to finish
+        while self.num_finish_update_grad < len(self.all_addresses): # exclude the current machine
+            print(f"Waiting for machines to finish... currently {self.num_finish_update_grad + 1}/{len(self.all_addresses) + 1}")
+            time.sleep(0.1)
+        self.num_finish_update_grad = 0
+
 
     def run(self):
         self.announce_existence()
@@ -235,14 +355,15 @@ class Machine:
                 num_joined = len(self.all_addresses) + 1
                 print(f"Waiting for machines to join... currently {len(self.all_addresses) + 1}/{self.min_num_machines}")
             time.sleep(0.1) # sleep for a while before checking again
-            if time.time() > self.end_time - self.buffer_time - self.inference_time:
-                self.end_time += self.increment_time
+            # if time.time() > self.end_time - self.buffer_time - self.inference_time:
+            #     self.end_time += self.increment_time
         initialization_time = time.time() + 20
         while time.time() < initialization_time:
             time.sleep(0.1)  # make sure all machines have time to initialize
-        while time.time() > self.end_time - self.buffer_time - self.inference_time:
-            self.end_time += self.increment_time
-        print("Starting with end time", self.end_time)
+
+        # while time.time() > self.end_time - self.buffer_time - self.inference_time:
+        #     self.end_time += self.increment_time
+        # print("Starting with end time", self.end_time)
 
         while True:  # Run the training loop
             with torch.inference_mode():
@@ -256,6 +377,10 @@ class Machine:
                     self.backup_weights = {k: v.cpu() for k, v in self.model.state_dict().items()}
                 print("Calculating losses.")
                 self.update_weights()
+
+                self.notify_finish_update_grad()
+                self.wait_till_finish_update_grad()
+
                 if self.use_backup:
                     print("Restoring weights.")
                     self.model.load_state_dict(self.backup_weights)
@@ -263,11 +388,15 @@ class Machine:
                 all_projected_grads = self.request_grads_from_all_machines()
                 print("Applying gradients.")
                 self.apply_all_grads(all_projected_grads)
-                print("Finished training for this round ending at", self.end_time)
+
+                self.notify_finish_update_grad()
+                self.wait_till_finish_update_grad()
+
+                print("Finished training for this round ending at", time.time())
                 if self.all_addresses:  # Choose a random address to check the hash
                     self.model = confirm_hash(np.random.choice(self.all_addresses), self.model)
                 self.total_iterations += 1
-                self.end_time += self.increment_time
+                # self.end_time += self.increment_time
 
 def calculate_loss(model, tokenizer, batch):
     tokenized_batch = tokenizer(batch, return_tensors='pt', padding=True, truncation=True)
@@ -298,11 +427,17 @@ def model_processing(model, dtype, device, use_lora):
         model = get_peft_model(model, peft_config)
     return model
 
-def set_seed(end_time, timestamp, sample_number):
-    diff_time = abs(end_time - timestamp) # Convert timestamps to 32-bit integer
-    timer = format(diff_time, '.8f').replace('.', '')
+# def set_seed(end_time, timestamp, sample_number):
+    # print(f"end_time: {end_time}, timestamp: {timestamp}, sample_number: {sample_number}")
+    # diff_time = abs(end_time - timestamp) # Convert timestamps to 32-bit integer
+    # timer = format(diff_time, '.8f').replace('.', '')
+def set_seed(total_iterations, sample_number):
+    timer = str(total_iterations)
     full_seed = int(timer + str(sample_number))  # Sample number is already an int
+    # print(f"Setting seed to {full_seed}")
+    # np.random.seed(full_seed)
     torch.manual_seed(full_seed)
+    torch.cuda.manual_seed(full_seed)
 
 def resize_token_embeddings(model, new_size):
     cur_seed = torch.seed()
@@ -327,6 +462,7 @@ def confirm_hash(address, model):
         except:  # If the hash don't match, the model is reset
             print("Error: No response from address, assuming hash is correct.")
         if calculate_hash(model) != response.json()['hash']:
+            import pdb; pdb.set_trace()
             print("Hashes don't match.")
             model = None
         else:
@@ -340,10 +476,17 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--epsilon', type=float, default=1e-3)
     parser.add_argument('--increment_time', type=float, default=30)
-    parser.add_argument('--buffer_time', type=float, default=10)
+    parser.add_argument('--gradient_acc_steps', type=float, default=30)
+    parser.add_argument('--buffer_time', type=float, default=0)
     parser.add_argument('--inference_time', type=float, default=1)
     parser.add_argument('--min_num_machines', type=int, default=2)
+    parser.add_argument('--send_full_grad', type=bool, default=False)
+    parser.add_argument('--normal', type=bool, default=False)
+    parser.add_argument('--use_differnt_gpu', type=bool, default=False)
+    parser.add_argument('--start_ip', type=str, default= "127.0.0.1")
+    parser.add_argument('--self_ip', type=str, default= "127.0.0.1")
+    parser.add_argument('--debug', type=bool, default=False)
     args = parser.parse_args()
-    server = Machine(f'http://127.0.0.1:{args.port}', [f'http://127.0.0.1:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines)
+    server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_differnt_gpu=args.use_differnt_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps)
     Thread(target=server.start_server, args=(args.port,)).start()
     server.run()
