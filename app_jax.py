@@ -150,7 +150,7 @@ class Machine:
                 self.model_name
             )
             if self.backend != 'jax':
-                self.model..eval()
+                self.model.eval()
         else:
             random_address = np.random.choice(self.all_addresses)
             print("Getting model from", random_address)
@@ -168,7 +168,7 @@ class Machine:
             print("Loaded model from", random_address)
         if self.model.config.pad_token_id == -1:
             self.model.config.pad_token_id = self.tokenizer.pad_token_id
-        self.model = model_processing(self.model, self.dtype, self.device, self.use_lora)
+        self.model = model_processing(self.model, self.dtype, self.device, self.use_lora, self.backend)
 
     ### Server functions ###
     def start_server(self, port):
