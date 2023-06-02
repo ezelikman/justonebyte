@@ -175,7 +175,7 @@ class Machine:
                     self.announce_existence()
                     break
                 continue
-        
+
             for addr in response['all_addresses']:
                 if addr not in self.all_addresses and addr != self.my_address:
                     self.all_addresses.append(addr)
@@ -197,13 +197,13 @@ class Machine:
             else:
                 z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
             param.data = param.data + scaling_factor * z * self.epsilon
-           
+
     def get_model_grad(self):
         for param_name, param in self.model.named_parameters():
             if self.use_lora and 'lora' not in param_name:
                 continue
             self.grad[param_name] = param.grad.data.clone()
-            
+
     def accumulate_grad(self, scaling_factor, timestamp, sample_number):
         set_seed(self.total_iterations, timestamp - self.min_machine_timestamp, sample_number)
         for param_name, param in self.model.named_parameters():
@@ -214,13 +214,12 @@ class Machine:
                 self.grad[param_name] = scaling_factor * z * self.epsilon
             else:
                 self.grad[param_name] += scaling_factor * z * self.epsilon
-    
+
     def apply_full_grad(self, scaling_factor, grad):
         for param_name, param in self.model.named_parameters():
             if self.use_lora and 'lora' not in param_name:
                 continue
             param.data = param.data + scaling_factor * grad[param_name]
-           
 
     def update_weights(self):
         self.grad = {"num_samples": 0}
@@ -255,14 +254,12 @@ class Machine:
                 if self.send_full_grad:
                     self.grad["num_samples"] += 1
                     self.accumulate_grad(self.projected_grads[-1], self.timestamp, self.sample_number)
-
                 print(f"Projected gradient: {self.projected_grads[-1]} - time elapsed: {time.time() - init_time}, loss = {(loss_1 + loss_2) / 2}")
             # If the elapsed time is greater than the inference time, warn the user
             if time.time() - init_time > self.inference_time:
                 print("Warning: updating preset inference time to the actual inference time.")
                 self.inference_time = time.time() - init_time
             self.sample_number += 1
-
         if self.sample_number < self.gradient_acc_steps:
             print("Warning: did not have enough samples to reach desired gradients accumulation steps.")
         # Write mean loss to loss.txt
@@ -279,7 +276,6 @@ class Machine:
                 if self.send_full_grad or self.normal:
                     response = requests.get(f"{address}/grads")
                     grad = pickle.loads(response.content)
-
                 else:
                     response = requests.get(f"{address}/grads").json()
                     if not 'grads' in response:
@@ -353,9 +349,7 @@ class Machine:
         if self.model is None:
             print("Model not initialized.")
             self.initialize_model()
-
         self.sync("finish initialize model", max(self.min_num_machines-1, len(self.all_addresses)))
-
         while self.total_iterations < self.max_iterations:  # Run the training loop
             with torch.inference_mode(mode = not self.normal):
                 print("Starting run.")
@@ -368,9 +362,7 @@ class Machine:
                     self.backup_weights = {k: v.cpu() for k, v in self.model.state_dict().items()}
                 print("Calculating losses.")
                 self.update_weights()
-
                 self.sync("finish forward pass")
-
                 if self.use_backup:
                     print("Restoring weights.")
                     self.model.load_state_dict(self.backup_weights)
@@ -378,9 +370,7 @@ class Machine:
                 all_projected_grads = self.request_grads_from_all_machines()
                 print("Applying gradients.")
                 self.apply_all_grads(all_projected_grads)
-
                 self.sync("finish applying gradients")
-
                 print("Finished training for this round ending at", time.time())
                 if self.all_addresses:  # Choose a random address to check the hash
                     self.model = confirm_hash(np.random.choice(self.all_addresses), self.model)
