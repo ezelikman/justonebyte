@@ -92,11 +92,8 @@ class Machine:
         def get_grads():
             if self.model is not None:
                 if self.send_full_grad or self.normal :
-                    # torch.save(self.grad, 'tmp_grad.pt')
-                    # print("start sending grad")
-                    # return send_file('tmp_grad.pt', as_attachment=True)
                     if self.normal:
-                        self.grad = self.get_grad(self.model)
+                        self.get_model_grad()
                     return Response(pickle.dumps(self.grad), mimetype='application/octet-stream')
                 else:
                     return {'grads': self.projected_grads}
@@ -234,16 +231,17 @@ class Machine:
                 self.grad["num_samples"] += 1
                 loss = calculate_loss(self.model, self.tokenizer, batch)
                 loss.backward()
-                # save to self.grad
+                self.losses.append(loss.item())
+                print(f"Projected gradient: disabled  - time elapsed: {time.time() - init_time}, loss = {loss.item()}")
             else:
                 self.perturbed = True
                 # calculate_hash(self.model)
-                s = time.time()
+                # s = time.time()
                 self.add_perturbation(1, self.timestamp, self.sample_number)
-                print(f"Time to add perturbation: {time.time() - s}")
-                loss_1 = calculate_loss(self.model, self.tokenizer, batch)
+                # print(f"Time to add perturbation: {time.time() - s}")
+                loss_1 = calculate_loss(self.model, self.tokenizer, batch).item()
                 self.add_perturbation(-2, self.timestamp, self.sample_number)
-                loss_2 = calculate_loss(self.model, self.tokenizer, batch)
+                loss_2 = calculate_loss(self.model, self.tokenizer, batch).item()
                 self.add_perturbation(1, self.timestamp, self.sample_number)
                 self.perturbed = False
                 self.projected_grads.append((loss_1 - loss_2) / (2 * self.epsilon))
@@ -252,7 +250,7 @@ class Machine:
                     self.grad["num_samples"] += 1
                     self.accumulate_grad( self.projected_grads[-1], self.timestamp, self.sample_number)
 
-            print(f"Projected gradient: {self.projected_grads[-1]} - time elapsed: {time.time() - init_time}, loss = {(loss_1 + loss_2) / 2}")
+                print(f"Projected gradient: {self.projected_grads[-1]} - time elapsed: {time.time() - init_time}, loss = {(loss_1 + loss_2) / 2}")
             # If the elapsed time is greater than the inference time, warn the user
             if time.time() - init_time > self.inference_time:
                 print("Warning: updating preset inference time to the actual inference time.")
@@ -277,7 +275,6 @@ class Machine:
             try:
                 if self.send_full_grad or self.normal:
                     response = requests.get(f"{address}/grads")
-                    print("received grad")
                     grad = pickle.loads(response.content)
 
                 else:
@@ -314,11 +311,11 @@ class Machine:
                     if self.debug:
                         breakpoint()
                     calculate_hash(self.model)
-                    s = time.time()
+                    # s = time.time()
                     self.add_perturbation(
                         -self.learning_rate * grad / num_samples,
                         self.addresses_timestamp[address], grad_idx, self.debug)
-                    print(f"Time to add perturbation: {time.time() - s}")
+                    # print(f"Time to add perturbation: {time.time() - s}")
         self.perturbed = False
         with open(f'loss_send_full_grad={self.send_full_grad}_normal={self.normal}_{self.addresses_timestamp[self.main_machine_address]}.txt', 'a+') as f:
             f.write(self.my_address+": " + str(np.mean(self.losses)) + " start grad time: " + str(start_round_time - self.timestamp)  +" finish grad time: " + str(time.time() - self.timestamp) +  '\n')
@@ -366,7 +363,7 @@ class Machine:
         # print("Starting with end time", self.end_time)
 
         while True:  # Run the training loop
-            with torch.inference_mode():
+            with torch.inference_mode(mode = not self.normal):
                 print("Starting run.")
                 self.announce_existence()
                 if self.model is None:
@@ -404,7 +401,7 @@ def calculate_loss(model, tokenizer, batch):
     tokenized_batch = {k: v.to(device) for k, v in tokenized_batch.items()}
     outputs = model(**tokenized_batch, labels=tokenized_batch["input_ids"])
     loss = outputs.loss
-    return loss.item()
+    return loss
 
 def get_batch(batch_size, dataset, dataset_index):
     # Randomly choose indices for batch sampling
