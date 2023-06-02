@@ -42,7 +42,7 @@ class Machine:
         self.normal=normal
         self.inference_time = inference_time  # Time per inference, should be an upper bound
         self.all_addresses = initial_server_addresses  # Addresses of all known servers
-        self.min_machine_timestamp = 0  # Timestamp of the first machine
+        self.min_machine_timestamp = 0.  # Timestamp of the first machine
         self.min_num_machines = min_num_machines  # Minimum number of machines to train with
         if my_address in self.all_addresses:
             self.all_addresses.remove(my_address)
@@ -174,7 +174,7 @@ class Machine:
                 if addr not in self.all_addresses and addr != self.my_address:
                     self.all_addresses.append(addr)
             self.addresses_timestamp.update(response['timestamps'])
-            self.min_machine_timestamp = min(list(self.addresses_timestamp.keys()))
+            self.min_machine_timestamp = min(list(self.addresses_timestamp.values()))
             self.learning_rate = response['learning_rate']
             self.total_iterations = response['total_iterations']
 
