@@ -18,7 +18,7 @@ class Machine:
                 increment_time, buffer_time, inference_time,
                 epsilon=0.001, batch_size=16, use_backup=True,
                 model_name='gpt2', dataset_name=('gsm8k', 'main'), dataset_index='question',
-                device='best', dtype=torch.float16, use_lora=False, min_num_machines=2, send_full_grad=False, normal=False, use_differnt_gpu=False, debug=False, gradient_acc_steps=1
+                device='best', dtype=torch.float16, use_lora=False, min_num_machines=2, send_full_grad=False, normal=False, use_different_gpu=False, debug=False, gradient_acc_steps=1, learning_rate=1e-1
         ):
         self.my_address = my_address
         self.dataset_name = dataset_name  # Name of the dataset to be used
@@ -60,9 +60,10 @@ class Machine:
         self.backup_weights = None
         self.total_iterations = 0
         self.num_finish_update_grad = 0
-        self.use_differnt_gpu = use_differnt_gpu
+        self.use_different_gpu = use_different_gpu
         self.debug = debug
         self.gradient_acc_steps=gradient_acc_steps
+        self.learning_rate=learning_rate # learning rate for the optimizer; will be overwritten by the main machine if it is not the main machine
         self.app = Flask(__name__)
 
         @self.app.route('/model', methods=['GET'])
@@ -126,7 +127,7 @@ class Machine:
     def initialize_run(self):
         self.initialize_model()
         # self.end_time = time.time() + self.increment_time
-        self.learning_rate = 1e-1
+        # self.learning_rate = 1e-1
 
     def initialize_model(self, use_default=False):
         if use_default or self.total_iterations == 0:
@@ -181,7 +182,7 @@ class Machine:
                 continue
             if debug:
                 breakpoint()
-            if self.use_differnt_gpu:
+            if self.use_different_gpu:
                 z = torch.normal(mean=0, std=1, size=param.data.size(), dtype=param.data.dtype).to(param.data.device)
             else:
                 z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
@@ -201,9 +202,9 @@ class Machine:
                 continue
             z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
             if param_name not in self.grad:
-                self.grad[param_name] = z * self.epsilon
+                self.grad[param_name] = scaling_factor * z * self.epsilon
             else:
-                self.grad[param_name] += z * self.epsilon
+                self.grad[param_name] += scaling_factor * z * self.epsilon
     
     def apply_full_grad(self, scaling_factor, grad):
         for param_name, param in self.model.named_parameters():
@@ -473,17 +474,18 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--epsilon', type=float, default=1e-3)
     parser.add_argument('--increment_time', type=float, default=30)
+    parser.add_argument('--learning_rate', type=float, default=1e-1)
     parser.add_argument('--gradient_acc_steps', type=float, default=30)
     parser.add_argument('--buffer_time', type=float, default=0)
     parser.add_argument('--inference_time', type=float, default=1)
     parser.add_argument('--min_num_machines', type=int, default=2)
     parser.add_argument('--send_full_grad', type=bool, default=False)
     parser.add_argument('--normal', type=bool, default=False)
-    parser.add_argument('--use_differnt_gpu', type=bool, default=False)
+    parser.add_argument('--use_different_gpu', type=bool, default=False)
     parser.add_argument('--start_ip', type=str, default= "127.0.0.1")
     parser.add_argument('--self_ip', type=str, default= "127.0.0.1")
     parser.add_argument('--debug', type=bool, default=False)
     args = parser.parse_args()
-    server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_differnt_gpu=args.use_differnt_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps)
+    server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate)
     Thread(target=server.start_server, args=(args.port,)).start()
     server.run()
