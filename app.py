@@ -44,7 +44,7 @@ class Machine:
         self.normal=normal
         self.inference_time = inference_time  # Time per inference, should be an upper bound
         self.all_addresses = initial_server_addresses  # Addresses of all known servers
-        self.main_machine_address = self.all_addresses[0]  # Address of the main machine
+        self.min_machine_timestamp = 0  # Timestamp of the first machine
         self.min_num_machines = min_num_machines  # Minimum number of machines to train with
         if my_address in self.all_addresses:
             self.all_addresses.remove(my_address)
@@ -180,12 +180,13 @@ class Machine:
                 if addr not in self.all_addresses and addr != self.my_address:
                     self.all_addresses.append(addr)
             self.addresses_timestamp.update(response['timestamps'])
+            self.min_machine_timestamp = min(list(self.addresses_timestamp.keys()))
             self.learning_rate = response['learning_rate']
             self.total_iterations = response['total_iterations']
 
     ### Training functions ###
     def add_perturbation(self, scaling_factor, timestamp, sample_number, debug=False):
-        set_seed(self.total_iterations, timestamp, sample_number)
+        set_seed(self.total_iterations, timestamp - self.min_machine_timestamp, sample_number)
         for param_name, param in self.model.named_parameters():
             if self.use_lora and 'lora' not in param_name:
                 continue
@@ -204,7 +205,7 @@ class Machine:
             self.grad[param_name] = param.grad.data.clone()
             
     def accumulate_grad(self, scaling_factor, timestamp, sample_number):
-        set_seed(self.total_iterations, timestamp, sample_number)
+        set_seed(self.total_iterations, timestamp - self.min_machine_timestamp, sample_number)
         for param_name, param in self.model.named_parameters():
             if self.use_lora and 'lora' not in param_name:
                 continue
@@ -243,10 +244,7 @@ class Machine:
                 print(f"Projected gradient: disabled  - time elapsed: {time.time() - init_time}, loss = {loss.item()}")
             else:
                 self.perturbed = True
-                # calculate_hash(self.model)
-                # s = time.time()
                 self.add_perturbation(1, self.timestamp, self.sample_number)
-                # print(f"Time to add perturbation: {time.time() - s}")
                 loss_1 = calculate_loss(self.model, self.tokenizer, batch).item()
                 self.add_perturbation(-2, self.timestamp, self.sample_number)
                 loss_2 = calculate_loss(self.model, self.tokenizer, batch).item()
@@ -256,7 +254,7 @@ class Machine:
                 self.losses.append((loss_1 + loss_2) / 2)
                 if self.send_full_grad:
                     self.grad["num_samples"] += 1
-                    self.accumulate_grad( self.projected_grads[-1], self.timestamp, self.sample_number)
+                    self.accumulate_grad(self.projected_grads[-1], self.timestamp, self.sample_number)
 
                 print(f"Projected gradient: {self.projected_grads[-1]} - time elapsed: {time.time() - init_time}, loss = {(loss_1 + loss_2) / 2}")
             # If the elapsed time is greater than the inference time, warn the user
@@ -269,7 +267,7 @@ class Machine:
             print("Warning: did not have enough samples to reach desired gradients accumulation steps.")
         # Write mean loss to loss.txt
         model_name = self.model_name.split('/')[-1]
-        with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.addresses_timestamp[self.main_machine_address]}.txt', 'a+') as f:
+        with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}.txt', 'a+') as f:
             f.write(self.my_address+": " + str(np.mean(self.losses)) + " start inference time: " + str(start_round_time - self.timestamp)  +" finish inference time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + '\n')
 
     def request_grads_from_all_machines(self):
@@ -319,7 +317,7 @@ class Machine:
                         self.addresses_timestamp[address], grad_idx, self.debug)
         self.perturbed = False
         model_name = self.model_name.split('/')[-1]
-        with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.addresses_timestamp[self.main_machine_address]}.txt', 'a+') as f:
+        with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}.txt', 'a+') as f:
             f.write(self.my_address+": " + str(np.mean(self.losses)) + " start grad time: " + str(start_round_time - self.timestamp)  +" finish grad time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + '\n')
 
     def notify_finish(self, description="initialize"):
@@ -418,7 +416,7 @@ def model_processing(model, dtype, device, use_lora):
     return model
 
 def set_seed(total_iterations, timestamp, sample_number):
-    timer = f'{timestamp:.6f}'.split('.')[-1]
+    timer = int(f'{timestamp:.6f}'.replace('.', ''))
     full_seed = int(f'{total_iterations}{sample_number:05}{timer}')
     torch.manual_seed(full_seed)
     torch.cuda.manual_seed(full_seed)
