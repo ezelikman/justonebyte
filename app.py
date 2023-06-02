@@ -185,7 +185,7 @@ class Machine:
 
     ### Training functions ###
     def add_perturbation(self, scaling_factor, timestamp, sample_number, debug=False):
-        set_seed(self.total_iterations, sample_number)
+        set_seed(self.total_iterations, timestamp, sample_number)
         for param_name, param in self.model.named_parameters():
             if self.use_lora and 'lora' not in param_name:
                 continue
@@ -204,7 +204,7 @@ class Machine:
             self.grad[param_name] = param.grad.data.clone()
             
     def accumulate_grad(self, scaling_factor, timestamp, sample_number):
-        set_seed(self.total_iterations, sample_number)
+        set_seed(self.total_iterations, timestamp, sample_number)
         for param_name, param in self.model.named_parameters():
             if self.use_lora and 'lora' not in param_name:
                 continue
@@ -417,9 +417,9 @@ def model_processing(model, dtype, device, use_lora):
         model = get_peft_model(model, peft_config)
     return model
 
-def set_seed(total_iterations, sample_number, max_samples_per_iteration_per_device=100_000):
-    full_seed = total_iterations * max_samples_per_iteration_per_device + sample_number
-    timer = int(f'{total_iterations}{sample_number:06}')
+def set_seed(total_iterations, timestamp, sample_number):
+    timer = f'{timestamp:.6f}'.split('.')[-1]
+    full_seed = int(f'{total_iterations}{sample_number:05}{timer}')
     torch.manual_seed(full_seed)
     torch.cuda.manual_seed(full_seed)
 
