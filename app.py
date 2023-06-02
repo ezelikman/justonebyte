@@ -89,8 +89,6 @@ class Machine:
         
         @self.app.route('/hash', methods=['GET'])
         def get_hash():
-            # while (time.time() < self.end_time - self.buffer_time) or self.perturbed:
-            #     time.sleep(0.1)
             while self.perturbed:
                 time.sleep(0.1)
             return {'hash': calculate_hash(self.model)}
@@ -133,8 +131,6 @@ class Machine:
     ### Initialization functions ###
     def initialize_run(self):
         self.initialize_model()
-        # self.end_time = time.time() + self.increment_time
-        # self.learning_rate = 1e-1
 
     def initialize_model(self, use_default=False):
         if use_default or self.total_iterations == 0:
