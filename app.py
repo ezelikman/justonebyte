@@ -10,6 +10,7 @@ from flask import Flask, request, send_file, Response
 from threading import Thread
 import hashlib
 import pickle
+from collections import defaultdict
 
 class Machine:
     def __init__(self, my_address, initial_server_addresses,
@@ -17,7 +18,7 @@ class Machine:
                 epsilon=0.001, batch_size=16, use_backup=True,
                 model_name='gpt2', dataset_name=('gsm8k', 'main'), dataset_index='question',
                 device='best', dtype=torch.float16, use_lora=False, min_num_machines=2, send_full_grad=False,
-                normal=False, use_different_gpu=False, debug=False, gradient_acc_steps=1, learning_rate=1e-1,
+                normal=False, use_different_gpu=False, debug=False, gradient_acc_steps=1, learning_rate=1e-1, max_iterations = 300
         ):
         self.my_address = my_address
         self.dataset_name = dataset_name  # Name of the dataset to be used
@@ -61,18 +62,16 @@ class Machine:
         self.use_backup = use_backup
         self.backup_weights = None
         self.total_iterations = 0
-        self.num_finish = {
-            "finish initialize model": 0,
-            "finish forward pass": 0,
-            "finish applying gradients": 0,
-            "exit": 0,
-        }
+        self.num_finish = defaultdict(int)
         self.use_different_gpu = use_different_gpu
         self.debug = debug
         self.gradient_acc_steps=gradient_acc_steps
-        self.max_iterations = 300
+        self.max_iterations = max_iterations
         self.learning_rate=learning_rate # learning rate for the optimizer; will be overwritten by the main machine if it is not the main machine
         self.app = Flask(__name__)
+        # check gpu is available
+        assert torch.cuda.is_available(), "No GPU/CUDA is detected!"
+
 
         @self.app.route('/model', methods=['GET'])
         def get_model():
@@ -381,12 +380,13 @@ class Machine:
         self.sync("exit")
 
 def calculate_loss(model, tokenizer, batch):
-    tokenized_batch = tokenizer(batch, return_tensors='pt', padding=True, truncation=True, return_token_type_ids=False if "llama" in tokenizer.name_or_path else None)
-    device = next(model.parameters()).device
-    tokenized_batch = {k: v.to(device) for k, v in tokenized_batch.items()}
-    outputs = model(**tokenized_batch, labels=tokenized_batch["input_ids"])
-    loss = outputs.loss
-    return loss
+    with torch.autocast("cuda"):
+        tokenized_batch = tokenizer(batch, return_tensors='pt', padding=True, truncation=True, return_token_type_ids=False if "llama" in tokenizer.name_or_path else None)
+        device = next(model.parameters()).device
+        tokenized_batch = {k: v.to(device) for k, v in tokenized_batch.items()}
+        outputs = model(**tokenized_batch, labels=tokenized_batch["input_ids"])
+        loss = outputs.loss
+        return loss
 
 def get_batch(batch_size, dataset, dataset_index):
     # Randomly choose indices for batch sampling
@@ -454,6 +454,7 @@ if __name__ == '__main__':
     parser.add_argument('--epsilon', type=float, default=1e-3)
     parser.add_argument('--increment_time', type=float, default=1000)
     parser.add_argument('--learning_rate', type=float, default=1e-1)
+    parser.add_argument('--max_iterations', type=int, default=300)
     parser.add_argument('--gradient_acc_steps', type=float, default=30)
     parser.add_argument('--buffer_time', type=float, default=0)
     parser.add_argument('--inference_time', type=float, default=1)
@@ -465,9 +466,8 @@ if __name__ == '__main__':
     parser.add_argument('--self_ip', type=str, default= "127.0.0.1")
     parser.add_argument('--debug', type=bool, default=False)
     args = parser.parse_args()
-    server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate)
+    server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate, max_iterations=args.max_iterations)
     Thread(target=server.start_server, args=(args.port,)).start()
     server.run()
     # close server after done training
     requests.post('http://0.0.0.0:{}/shutdown'.format(args.port))
-
