@@ -14,6 +14,7 @@ from flax.core.frozen_dict import freeze, unfreeze
 import jax
 import jax.numpy as jnp
 import jax.nn
+import math
 
 class Machine:
     def __init__(self, my_address, initial_server_addresses,
@@ -22,7 +23,7 @@ class Machine:
                 model_name='gpt2', dataset_name=('gsm8k', 'main'), dataset_index='question',
                 device='best', dtype=torch.float16, use_lora=False, min_num_machines=2, send_full_grad=False,
                 normal=False, use_different_gpu=False, debug=False, gradient_acc_steps=1, learning_rate=1e-1,
-                backend='pt'
+                backend='jax'
         ):
         self.backend = backend
         self.add_perturbation = self.add_perturbation_jax if self.backend == 'jax' else self.add_perturbation_torch
@@ -35,7 +36,6 @@ class Machine:
             if backend != 'jax':
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             else:
-                import jax
                 device = jax.devices('gpu')[0]
         self.device = device  # Device to run model on
         self.model = None  # Model to be trained
@@ -80,6 +80,24 @@ class Machine:
         self.max_iterations = 300
         self.learning_rate=learning_rate # learning rate for the optimizer; will be overwritten by the main machine if it is not the main machine
         self.app = Flask(__name__)
+
+        def calculate_tokenized_loss_jax(input_ids, attention_mask):
+            # Convert tokenized_batch to JAX arrays
+            outputs = self.model(input_ids, attention_mask)
+            logits = outputs.logits
+            labels = input_ids
+            loss = compute_loss(logits, labels)
+            return loss
+
+        def calculate_loss_jax(model, tokenizer, batch):
+            reference_batch = tokenizer(batch, padding=True, truncation=True, return_token_type_ids=False if "llama" in tokenizer.name_or_path else None, return_tensors='jax')
+            max_length = reference_batch['input_ids'].shape[-1]
+            max_length_power_of_two = 2**math.ceil(math.log(max_length, 2))
+            tokenized_batch = tokenizer(batch, padding='max_length', truncation=True, return_token_type_ids=False if "llama" in tokenizer.name_or_path else None, return_tensors='jax', max_length=max_length_power_of_two)
+            return self.calculate_tokenized_loss_jax(tokenized_batch['input_ids'], tokenized_batch['attention_mask'])
+
+        self.calculate_tokenized_loss_jax = jax.jit(calculate_tokenized_loss_jax)
+        self.calculate_loss = calculate_loss_jax if self.backend == "jax" else calculate_loss_torch
 
         @self.app.route('/model', methods=['GET'])
         def get_model():
@@ -261,17 +279,16 @@ class Machine:
             batch = get_batch(self.batch_size, self.dataset, self.dataset_index)
             if self.normal:
                 self.grad["num_samples"] += 1
-                loss = calculate_loss_torch(self.model, self.tokenizer, batch)
+                loss = self.calculate_loss_torch(self.model, self.tokenizer, batch)
                 loss.backward()
                 self.losses.append(loss.item())
                 print(f"Projected gradient: disabled  - time elapsed: {time.time() - init_time}, loss = {loss.item()}")
             else:
                 self.perturbed = True
-                calculate_loss = calculate_loss_jax if self.backend == "jax" else calculate_loss_torch
                 self.add_perturbation(1, self.timestamp, self.sample_number)
-                loss_1 = calculate_loss(self.model, self.tokenizer, batch).item()
+                loss_1 = self.calculate_loss(self.model, self.tokenizer, batch).item()
                 self.add_perturbation(-2, self.timestamp, self.sample_number)
-                loss_2 = calculate_loss(self.model, self.tokenizer, batch).item()
+                loss_2 = self.calculate_loss(self.model, self.tokenizer, batch).item()
                 self.add_perturbation(1, self.timestamp, self.sample_number)
                 self.perturbed = False
                 self.projected_grads.append((loss_1 - loss_2) / (2 * self.epsilon))
@@ -408,20 +425,13 @@ class Machine:
                     self.model = confirm_hash(np.random.choice(self.all_addresses), self.model)
                 self.total_iterations += 1
 
+@jax.jit
 def compute_loss(logits, labels):
     ignore_index = -100
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     log_probs = jnp.take_along_axis(log_probs, labels[..., None], axis=-1).squeeze(-1)
     loss = jnp.where(labels != ignore_index, log_probs, 0)
     loss = -jnp.sum(loss) / jnp.sum(labels != ignore_index)
-    return loss
-
-def calculate_loss_jax(model, tokenizer, batch):
-    tokenized_batch = tokenizer(batch, padding=True, truncation=True, return_token_type_ids=False if "llama" in tokenizer.name_or_path else None, return_tensors='np')
-    outputs = model(**tokenized_batch)
-    logits = outputs.logits
-    labels = tokenized_batch["input_ids"]
-    loss = compute_loss(logits, labels)
     return loss
 
 def calculate_loss_torch(model, tokenizer, batch):
