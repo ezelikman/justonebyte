@@ -380,13 +380,12 @@ class Machine:
         self.sync("exit")
 
 def calculate_loss(model, tokenizer, batch):
-    with torch.autocast("cuda"):
-        tokenized_batch = tokenizer(batch, return_tensors='pt', padding=True, truncation=True, return_token_type_ids=False if "llama" in tokenizer.name_or_path else None)
-        device = next(model.parameters()).device
-        tokenized_batch = {k: v.to(device) for k, v in tokenized_batch.items()}
-        outputs = model(**tokenized_batch, labels=tokenized_batch["input_ids"])
-        loss = outputs.loss
-        return loss
+    tokenized_batch = tokenizer(batch, return_tensors='pt', padding=True, truncation=True, return_token_type_ids=False if "llama" in tokenizer.name_or_path else None)
+    device = next(model.parameters()).device
+    tokenized_batch = {k: v.to(device) for k, v in tokenized_batch.items()}
+    outputs = model(**tokenized_batch, labels=tokenized_batch["input_ids"])
+    loss = outputs.loss
+    return loss
 
 def get_batch(batch_size, dataset, dataset_index):
     # Randomly choose indices for batch sampling
