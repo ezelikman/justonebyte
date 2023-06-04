@@ -137,8 +137,8 @@ class Machine:
         @self.app.route('/notify_finish', methods=['POST'])
         def update_num_finish():
             description = request.json['description']
-            self.num_finish[description].add(request['address'])
-            return {'num_finish': self.num_finish[description]}, 200
+            self.num_finish[description].add(request.json['address'])
+            return {'num_finish': len(self.num_finish[description])}, 200
 
         @self.app.route('/notify', methods=['POST'])
         def notify_new_server():
@@ -282,11 +282,11 @@ class Machine:
             f.write(self.my_address+": " + str(mean_loss) + " start eval time: " + str(start_round_time - self.timestamp)  +" finish eval time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + " num samples: 10\n")
             wandb.log({
                 "machine_address": self.my_address,
-                "mean_loss": mean_loss,
+                "mean_eval_loss": mean_loss,
                 "start_eval_time": start_round_time - self.timestamp,
                 "finish_eval_time": time.time() - self.timestamp,
                 "iteration": self.total_iterations,
-                "num_samples": 10
+                "num_eval_samples": 10
             })
         return mean_loss
 
@@ -340,11 +340,11 @@ class Machine:
             wandb.log({
                 "mode": "train",
                 "machine_address": self.my_address,
-                "mean_loss": mean_loss,
+                "mean_inference_loss": mean_loss,
                 "start_inference_time": start_round_time - self.timestamp,
                 "finish_inference_time": time.time() - self.timestamp,
                 "iteration": self.total_iterations,
-                "num_samples": self.sample_number
+                "num_inference_samples": self.sample_number
             })
 
     def evaluate_model(self):
@@ -381,11 +381,11 @@ class Machine:
             wandb.log({
                 "mode": True,
                 "machine_address": self.my_address,
-                "mean_loss": mean_loss,
+                "mean_inference_loss": mean_loss,
                 "start_inference_time": start_round_time - self.timestamp,
                 "finish_inference_time": time.time() - self.timestamp,
                 "iteration": self.total_iterations,
-                "num_samples": self.sample_number
+                "num_inference_samples": self.sample_number
             })
 
     def request_grads_from_all_machines(self):
@@ -438,11 +438,11 @@ class Machine:
             f.write(f'{self.my_address}: apply {mean_loss} start grad time: {start_round_time - self.timestamp} finish grad time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {num_samples}\n')
             wandb.log({
                 "machine_address": self.my_address,
-                "mean_loss": mean_loss,
+                "mean_grad_loss": mean_loss,
                 "start_grad_time": start_round_time - self.timestamp,
                 "finish_grad_time": time.time() - self.timestamp,
                 "iteration": self.total_iterations,
-                "num_samples": num_samples
+                "num_grad_samples": num_samples
             })
 
 
@@ -645,13 +645,14 @@ if __name__ == '__main__':
     parser.add_argument('--start_ip', type=str, default= "127.0.0.1")
     parser.add_argument('--self_ip', type=str, default= "127.0.0.1")
     parser.add_argument('--debug', type=bool, default=False)
-    wandb.init(project="justonebyte")
-
+    
     args = parser.parse_args()
     server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate, max_iterations=args.max_iterations, dataset_name=args.dataset_name, dataset_index=args.dataset_index, use_bnb=args.use_bnb)
+    wandb.init(project="justonebyte", name = f'{args.model_name}_full_grad={args.send_full_grad}_normal={args.normal}_{server.timestamp}_{args.self_ip}_{args.learning_rate}')
+
     #save config
-    with open(f'config_{args.self_ip}_{server.timestamp}.json', 'w') as f:
-        json.dump(vars(args), f)
+    # with open(f'config_{args.self_ip}_{server.timestamp}.json', 'w') as f:
+    #     json.dump(vars(args), f)
     wandb.config.update(args)
 
     t = Thread(target=server.start_server, args=(args.port,))
