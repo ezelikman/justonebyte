@@ -83,7 +83,7 @@ class Machine:
         if self.use_bnb:
             self.quant_type = "nf4"
             self.unquant_type = torch.bfloat16
-            bnb_config = BitsAndBytesConfig(
+            self.bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type=self.quant_type,
@@ -166,13 +166,14 @@ class Machine:
             if self.use_bnb:
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.model_name if not "llama" in self.model_name else "decapoda-research/" + self.model_name,
-                    quantization_config=bnb_config,
+                    quantization_config=self.bnb_config,
                     device_map='auto'
                 ).eval()
             else:
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.model_name if not "llama" in self.model_name else "decapoda-research/" + self.model_name
                 ).eval()
+            wandb.watch(self.model)
         else:
             random_address = np.random.choice(self.all_addresses)
             print("Getting model from", random_address)
@@ -227,10 +228,10 @@ class Machine:
                 z = torch.normal(mean=0, std=1, size=param.data.size(), dtype=param.data.dtype).to(param.data.device)
             else:
                 if isinstance(param, bnb.nn.Params4bit):
-                    param_dequantized = bnb.functional.dequantize_4bit(param, param.quant_state, quant_type=quant_type)
+                    param_dequantized = bnb.functional.dequantize_4bit(param, param.quant_state, quant_type=self.quant_type)
                     z = torch.normal(mean=0, std=1, size=param_dequantized.data.size(), device=param_dequantized.data.device, dtype=param_dequantized.data.dtype)
                     param_dequantized.data = param_dequantized.data + scaling_factor * z * self.epsilon
-                    param_requantized, param_requantized_state = bnb.functional.quantize_4bit(param_dequantized, quant_type=quant_type)
+                    param_requantized, param_requantized_state = bnb.functional.quantize_4bit(param_dequantized, quant_type=self.quant_type)
                     param.data = param_requantized.data
                     param.quant_state = param_requantized_state
                 else:
@@ -270,9 +271,17 @@ class Machine:
                 loss = calculate_loss(self.model, self.tokenizer, batch)
                 losses.append(loss.item())
         with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
-            f.write(self.my_address+": " + str(np.mean(losses)) + " start eval time: " + str(start_round_time - self.timestamp)  +" finish eval time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + " num samples: 10\n")
-        return np.mean(losses)
-        
+            mean_loss = np.mean(losses)
+            f.write(self.my_address+": " + str(mean_loss) + " start eval time: " + str(start_round_time - self.timestamp)  +" finish eval time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + " num samples: 10\n")
+            wandb.log({
+                "machine_address": self.my_address,
+                "mean_loss": mean_loss,
+                "start_eval_time": start_round_time - self.timestamp,
+                "finish_eval_time": time.time() - self.timestamp,
+                "iteration": self.total_iterations,
+                "num_samples": 10
+            })
+        return mean_loss
 
     def update_weights(self):
         self.grad = {"num_samples": 0}
@@ -319,7 +328,16 @@ class Machine:
             print("Warning: did not have enough samples to reach desired gradients accumulation steps.")
         # Write mean loss to loss.txt
         with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
-            f.write(f'{self.my_address}: {np.mean(self.losses)} start inference time: {start_round_time - self.timestamp} finish inference time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {self.sample_number}\n')
+            mean_loss = np.mean(self.losses)
+            f.write(f'{self.my_address}: {mean_loss} start inference time: {start_round_time - self.timestamp} finish inference time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {self.sample_number}\n')
+            wandb.log({
+                "machine_address": self.my_address,
+                "mean_loss": mean_loss,
+                "start_inference_time": start_round_time - self.timestamp,
+                "finish_inference_time": time.time() - self.timestamp,
+                "iteration": self.total_iterations,
+                "num_samples": self.sample_number
+            })
 
     def request_grads_from_all_machines(self):
         all_projected_grads = {
@@ -367,7 +385,17 @@ class Machine:
                         self.addresses_timestamp[address], grad_idx, self.debug)
         self.perturbed = False
         with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
-            f.write(f'{self.my_address}: {np.mean(self.losses)} start grad time: {start_round_time - self.timestamp} finish grad time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {num_samples}\n')
+            mean_loss = np.mean(self.losses)
+            f.write(f'{self.my_address}: {mean_loss} start grad time: {start_round_time - self.timestamp} finish grad time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {num_samples}\n')
+            log({
+                "machine_address": self.my_address,
+                "mean_loss": mean_loss,
+                "start_grad_time": start_round_time - self.timestamp,
+                "finish_grad_time": time.time() - self.timestamp,
+                "iteration": self.total_iterations,
+                "num_samples": num_samples
+            })
+
 
     def notify_finish(self, description="initialize"):
         for address in self.all_addresses:
@@ -453,7 +481,7 @@ def get_batch(batch_size, dataset, dataset_index):
     return batch
 
 def model_processing(model, dtype, device, use_lora, use_bnb):
-    if not self.use_bnb:
+    if not use_bnb:
         model.to(dtype)  # Process a model after loading it
         model.eval()
         model.to(device)
@@ -522,11 +550,14 @@ if __name__ == '__main__':
     parser.add_argument('--start_ip', type=str, default= "127.0.0.1")
     parser.add_argument('--self_ip', type=str, default= "127.0.0.1")
     parser.add_argument('--debug', type=bool, default=False)
+    wandb.init(project="justonebyte")
+
     args = parser.parse_args()
     server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate, max_iterations=args.max_iterations, dataset_name=args.dataset_name, dataset_index=args.dataset_index)
     #save config
     with open(f'config_{args.self_ip}_{server.timestamp}.json', 'w') as f:
         json.dump(vars(args), f)
+    wandb.config.update(args)
 
     t = Thread(target=server.start_server, args=(args.port,))
     t.daemon = True
