@@ -1,4 +1,5 @@
 import numpy as np
+import sys
 import time
 import requests
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, LlamaTokenizer
@@ -13,14 +14,16 @@ from flask import Flask, request, send_file, Response
 from threading import Thread
 import hashlib
 import pickle
+import json
 from collections import defaultdict
 import bitsandbytes as bnb
+import wandb
 
 class Machine:
     def __init__(self, my_address, initial_server_addresses,
                 increment_time, buffer_time, inference_time,
                 epsilon=0.001, batch_size=16, use_backup=True,
-                model_name='gpt2', dataset_name=('gsm8k', 'main'), dataset_index='question',
+                model_name='gpt2', dataset_name=('sst2', 'main'), dataset_index='question',
                 device='best', dtype=torch.float16, use_lora=False, min_num_machines=2, send_full_grad=False,
                 normal=False, use_different_gpu=False, debug=False, gradient_acc_steps=1, learning_rate=1e-1, max_iterations = 300,
                 use_bnb=True,
@@ -53,7 +56,7 @@ class Machine:
         if my_address in self.all_addresses:
             self.all_addresses.remove(my_address)
         self.addresses_timestamp = {self.my_address: self.timestamp}  # Timestamps of all known servers
-        self.dataset = load_dataset(*self.dataset_name)['train']  # Initialize the dataset
+        self.dataset = load_dataset(*self.dataset_name)  # Initialize the dataset
         self.model_name = model_name  # Name of the model to be used
         if "llama" in model_name:
             self.tokenizer = LlamaTokenizer.from_pretrained("decapoda-research/" + model_name)
@@ -70,6 +73,7 @@ class Machine:
         self.num_finish = defaultdict(int)
         self.use_different_gpu = use_different_gpu
         self.debug = debug
+        self.eval_interval = 1
         self.gradient_acc_steps=gradient_acc_steps
         self.max_iterations = max_iterations
         self.learning_rate=learning_rate # learning rate for the optimizer; will be overwritten by the main machine if it is not the main machine
@@ -148,7 +152,7 @@ class Machine:
 
         @self.app.route('/shutdown', methods=['POST'])
         def shutdown():
-            self.server.shutdown()
+            self.app.shutdown()
             return 'Server shutting down...'
 
 
@@ -255,6 +259,20 @@ class Machine:
             if self.use_lora and 'lora' not in param_name:
                 continue
             param.data = param.data + scaling_factor * grad[param_name]
+    
+    def eval(self):
+        self.model.eval()
+        losses = []
+        start_round_time = time.time()
+        with torch.no_grad():
+            for i in range(10):
+                batch = get_batch(self.batch_size, self.dataset['test'], self.dataset_index)
+                loss = calculate_loss(self.model, self.tokenizer, batch)
+                losses.append(loss.item())
+        with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
+            f.write(self.my_address+": " + str(np.mean(losses)) + " start eval time: " + str(start_round_time - self.timestamp)  +" finish eval time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + " num samples: 10\n")
+        return np.mean(losses)
+        
 
     def update_weights(self):
         self.grad = {"num_samples": 0}
@@ -262,14 +280,16 @@ class Machine:
         self.losses = []
         self.sample_number = 0
         if self.normal:
+            self.model.train()
             self.model.zero_grad()
+
         start_round_time = time.time()
         while self.sample_number < self.gradient_acc_steps and  (time.time() - start_round_time) < self.increment_time:
             init_time = time.time()
             print(f"Sample number: {self.sample_number} - inference time remaining: {self.increment_time + start_round_time - time.time() }")
             while self.sending_weights:
                 time.sleep(0.1)
-            batch = get_batch(self.batch_size, self.dataset, self.dataset_index)
+            batch = get_batch(self.batch_size, self.dataset['train'], self.dataset_index)
             if self.normal:
                 self.grad["num_samples"] += 1
                 loss = calculate_loss(self.model, self.tokenizer, batch)
@@ -298,7 +318,7 @@ class Machine:
         if self.sample_number < self.gradient_acc_steps:
             print("Warning: did not have enough samples to reach desired gradients accumulation steps.")
         # Write mean loss to loss.txt
-        with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}.txt', 'a+') as f:
+        with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
             f.write(f'{self.my_address}: {np.mean(self.losses)} start inference time: {start_round_time - self.timestamp} finish inference time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {self.sample_number}\n')
 
     def request_grads_from_all_machines(self):
@@ -346,7 +366,7 @@ class Machine:
                         -self.learning_rate * grad / num_samples,
                         self.addresses_timestamp[address], grad_idx, self.debug)
         self.perturbed = False
-        with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}.txt', 'a+') as f:
+        with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
             f.write(f'{self.my_address}: {np.mean(self.losses)} start grad time: {start_round_time - self.timestamp} finish grad time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {num_samples}\n')
 
     def notify_finish(self, description="initialize"):
@@ -408,7 +428,10 @@ class Machine:
                 print(f"Finished training for iteration {self.total_iterations} ending at", time.time())
                 if self.all_addresses:  # Choose a random address to check the hash
                     self.model = confirm_hash(np.random.choice(self.all_addresses), self.model)
-            
+                if self.timestamp == self.min_machine_timestamp:
+                    if self.total_iterations % self.eval_interval == 0:
+                        self.eval()
+
         self.sync("exit")
 
 def calculate_loss(model, tokenizer, batch):
@@ -466,22 +489,24 @@ def calculate_hash(model, decimals=3):
     return model_hash
 
 def confirm_hash(address, model):
-        try:
-            response = requests.get(f"{address}/hash")
-        except:  # If the hash don't match, the model is reset
-            print("Error: No response from address, assuming hash is correct.")
-        if calculate_hash(model) != response.json()['hash']:
-            import pdb; pdb.set_trace()
-            print("Hashes don't match.")
-            model = None
-        else:
-            print("Hashes match.")
-        return model
+    try:
+        response = requests.get(f"{address}/hash")
+    except:  # If the hash don't match, the model is reset
+        print("Error: No response from address, assuming hash is correct.")
+    if calculate_hash(model) != response.json()['hash']:
+        import pdb; pdb.set_trace()
+        print("Hashes don't match.")
+        model = None
+    else:
+        print("Hashes match.")
+    return model
 
 if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument('--port', type=int, default=7000)
     parser.add_argument('--model_name', type=str, default='gpt2')
+    parser.add_argument('--dataset_name', type=tuple, default=('sst2', 'main'))
+    parser.add_argument('--dataset_index', type=str, default="sentence")
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--epsilon', type=float, default=1e-3)
     parser.add_argument('--increment_time', type=float, default=1000)
@@ -498,8 +523,13 @@ if __name__ == '__main__':
     parser.add_argument('--self_ip', type=str, default= "127.0.0.1")
     parser.add_argument('--debug', type=bool, default=False)
     args = parser.parse_args()
-    server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate, max_iterations=args.max_iterations)
-    Thread(target=server.start_server, args=(args.port,)).start()
+    server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate, max_iterations=args.max_iterations, dataset_name=args.dataset_name, dataset_index=args.dataset_index)
+    #save config
+    with open(f'config_{args.self_ip}_{server.timestamp}.json', 'w') as f:
+        json.dump(vars(args), f)
+
+    t = Thread(target=server.start_server, args=(args.port,))
+    t.daemon = True
+    t.start()
     server.run()
-    # close server after done training
-    requests.post('http://0.0.0.0:{}/shutdown'.format(args.port))
+    sys.exit()
