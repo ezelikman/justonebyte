@@ -2,15 +2,19 @@ import numpy as np
 import time
 import requests
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, LlamaTokenizer
+from transformers import BitsAndBytesConfig
 from datasets import load_dataset
 from argparse import ArgumentParser
 import torch
+import os
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ":4096:8"
 torch.use_deterministic_algorithms(True)
 from flask import Flask, request, send_file, Response
 from threading import Thread
 import hashlib
 import pickle
 from collections import defaultdict
+import bitsandbytes as bnb
 
 class Machine:
     def __init__(self, my_address, initial_server_addresses,
@@ -18,7 +22,8 @@ class Machine:
                 epsilon=0.001, batch_size=16, use_backup=True,
                 model_name='gpt2', dataset_name=('gsm8k', 'main'), dataset_index='question',
                 device='best', dtype=torch.float16, use_lora=False, min_num_machines=2, send_full_grad=False,
-                normal=False, use_different_gpu=False, debug=False, gradient_acc_steps=1, learning_rate=1e-1, max_iterations = 300
+                normal=False, use_different_gpu=False, debug=False, gradient_acc_steps=1, learning_rate=1e-1, max_iterations = 300,
+                use_bnb=True,
         ):
         self.my_address = my_address
         self.dataset_name = dataset_name  # Name of the dataset to be used
@@ -69,6 +74,18 @@ class Machine:
         self.max_iterations = max_iterations
         self.learning_rate=learning_rate # learning rate for the optimizer; will be overwritten by the main machine if it is not the main machine
         self.app = Flask(__name__)
+
+        self.use_bnb = use_bnb
+        if self.use_bnb:
+            self.quant_type = "nf4"
+            self.unquant_type = torch.bfloat16
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type=self.quant_type,
+                bnb_4bit_compute_dtype=self.unquant_type
+            )
+
         # check gpu is available
         assert torch.cuda.is_available(), "No GPU/CUDA is detected!"
 
@@ -142,9 +159,16 @@ class Machine:
     def initialize_model(self, use_default=False):
         if use_default or self.total_iterations == 0:
             print("Initializing default model")
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name if not "llama" in self.model_name else "decapoda-research/" + self.model_name,
-            ).eval()
+            if self.use_bnb:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name if not "llama" in self.model_name else "decapoda-research/" + self.model_name,
+                    quantization_config=bnb_config,
+                    device_map='auto'
+                ).eval()
+            else:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name if not "llama" in self.model_name else "decapoda-research/" + self.model_name
+                ).eval()
         else:
             random_address = np.random.choice(self.all_addresses)
             print("Getting model from", random_address)
@@ -161,7 +185,7 @@ class Machine:
             print("Loaded model from", random_address)
         if self.model.config.pad_token_id == -1:
             self.model.config.pad_token_id = self.tokenizer.pad_token_id
-        self.model = model_processing(self.model, self.dtype, self.device, self.use_lora)
+        self.model = model_processing(self.model, self.dtype, self.device, self.use_lora, self.use_bnb)
 
     ### Server functions ###
     def start_server(self, port):
@@ -198,8 +222,16 @@ class Machine:
             if self.use_different_gpu:
                 z = torch.normal(mean=0, std=1, size=param.data.size(), dtype=param.data.dtype).to(param.data.device)
             else:
-                z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
-            param.data = param.data + scaling_factor * z * self.epsilon
+                if isinstance(param, bnb.nn.Params4bit):
+                    param_dequantized = bnb.functional.dequantize_4bit(param, param.quant_state, quant_type=quant_type)
+                    z = torch.normal(mean=0, std=1, size=param_dequantized.data.size(), device=param_dequantized.data.device, dtype=param_dequantized.data.dtype)
+                    param_dequantized.data = param_dequantized.data + scaling_factor * z * self.epsilon
+                    param_requantized, param_requantized_state = bnb.functional.quantize_4bit(param_dequantized, quant_type=quant_type)
+                    param.data = param_requantized.data
+                    param.quant_state = param_requantized_state
+                else:
+                    z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                    param.data = param.data + scaling_factor * z * self.epsilon
 
     def get_model_grad(self):
         for param_name, param in self.model.named_parameters():
@@ -267,7 +299,7 @@ class Machine:
             print("Warning: did not have enough samples to reach desired gradients accumulation steps.")
         # Write mean loss to loss.txt
         with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}.txt', 'a+') as f:
-            f.write(self.my_address+": " + str(np.mean(self.losses)) + " start inference time: " + str(start_round_time - self.timestamp)  +" finish inference time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + " num samples: " + str(self.sample_number) + '\n')
+            f.write(f'{self.my_address}: {np.mean(self.losses)} start inference time: {start_round_time - self.timestamp} finish inference time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {self.sample_number}\n')
 
     def request_grads_from_all_machines(self):
         all_projected_grads = {
@@ -315,7 +347,7 @@ class Machine:
                         self.addresses_timestamp[address], grad_idx, self.debug)
         self.perturbed = False
         with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}.txt', 'a+') as f:
-            f.write(self.my_address+": " + str(np.mean(self.losses)) + " start grad time: " + str(start_round_time - self.timestamp)  +" finish grad time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + " num samples: " + str(num_samples) + '\n')
+            f.write(f'{self.my_address}: {np.mean(self.losses)} start grad time: {start_round_time - self.timestamp} finish grad time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {num_samples}\n')
 
     def notify_finish(self, description="initialize"):
         for address in self.all_addresses:
@@ -393,14 +425,15 @@ def get_batch(batch_size, dataset, dataset_index):
     batch = dataset[indices]  # Select the batch from the dataset
     batch = batch[dataset_index]
     batch = [text for text in batch if text.strip()]  # Filter empty strings
-    if len(batch) < 3:  # If the batch size doesn't match, try again
+    if len(batch) < 3 and batch_size >= 3:  # If the batch size doesn't match, try again
         return get_batch(batch_size, dataset, dataset_index)
     return batch
 
-def model_processing(model, dtype, device, use_lora):
-    model.to(dtype)  # Process a model after loading it
-    model.eval()
-    model.to(device)
+def model_processing(model, dtype, device, use_lora, use_bnb):
+    if not self.use_bnb:
+        model.to(dtype)  # Process a model after loading it
+        model.eval()
+        model.to(device)
     if use_lora:
         from peft import get_peft_model, LoraConfig, TaskType
         peft_config = LoraConfig(
