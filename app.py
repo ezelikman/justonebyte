@@ -387,7 +387,7 @@ class Machine:
         with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
             mean_loss = np.mean(self.losses)
             f.write(f'{self.my_address}: {mean_loss} start grad time: {start_round_time - self.timestamp} finish grad time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {num_samples}\n')
-            log({
+            wandb.log({
                 "machine_address": self.my_address,
                 "mean_loss": mean_loss,
                 "start_grad_time": start_round_time - self.timestamp,
