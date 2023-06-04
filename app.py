@@ -70,7 +70,7 @@ class Machine:
         self.use_backup = use_backup
         self.backup_weights = None
         self.total_iterations = 0
-        self.num_finish = defaultdict(int)
+        self.num_finish = defaultdict(set)
         self.use_different_gpu = use_different_gpu
         self.debug = debug
         self.eval_interval = 1
@@ -130,7 +130,7 @@ class Machine:
         @self.app.route('/notify_finish', methods=['POST'])
         def update_num_finish():
             description = request.json['description']
-            self.num_finish[description] += 1
+            self.num_finish[description].add(request['address'])
             return {'num_finish': self.num_finish[description]}, 200
 
         @self.app.route('/notify', methods=['POST'])
@@ -329,8 +329,50 @@ class Machine:
         # Write mean loss to loss.txt
         with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
             mean_loss = np.mean(self.losses)
-            f.write(f'{self.my_address}: {mean_loss} start inference time: {start_round_time - self.timestamp} finish inference time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {self.sample_number}\n')
+            f.write(f'{self.my_address}: train {mean_loss} start inference time: {start_round_time - self.timestamp} finish inference time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {self.sample_number}\n')
             wandb.log({
+                "mode": "train",
+                "machine_address": self.my_address,
+                "mean_loss": mean_loss,
+                "start_inference_time": start_round_time - self.timestamp,
+                "finish_inference_time": time.time() - self.timestamp,
+                "iteration": self.total_iterations,
+                "num_samples": self.sample_number
+            })
+
+    def evaluate_model(self):
+        self.sample_number = 0
+        self.losses = []
+        self.model.eval()
+
+        start_round_time = time.time()
+        while self.sample_number < self.gradient_acc_steps and  (time.time() - start_round_time) < self.increment_time:
+            init_time = time.time()
+            print(f"Sample number: {self.sample_number} - inference time remaining: {self.increment_time + start_round_time - time.time() }")
+            while self.sending_weights:
+                time.sleep(0.1)
+            batch = get_batch(self.batch_size, self.dataset['train'], self.dataset_index)
+
+            with torch.no_grad():
+                loss = calculate_loss(self.model, self.tokenizer, batch)
+                self.losses.append(loss.item())
+            print(f"Time elapsed: {time.time() - init_time}, loss = {loss.item()}")
+
+            # If the elapsed time is greater than the inference time, warn the user
+            if time.time() - init_time > self.inference_time:
+                print("Warning: updating preset inference time to the actual inference time.")
+                self.inference_time = time.time() - init_time
+            self.sample_number += 1
+
+        if self.sample_number < self.gradient_acc_steps:
+            print("Warning: did not have enough samples to reach desired inference steps.")
+
+        # Write mean loss to loss.txt
+        with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
+            mean_loss = np.mean(self.losses)
+            f.write(f'{self.my_address}: evaluate {mean_loss} start inference time: {start_round_time - self.timestamp} finish inference time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {self.sample_number}\n')
+            wandb.log({
+                "mode": True,
                 "machine_address": self.my_address,
                 "mean_loss": mean_loss,
                 "start_inference_time": start_round_time - self.timestamp,
@@ -386,7 +428,7 @@ class Machine:
         self.perturbed = False
         with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
             mean_loss = np.mean(self.losses)
-            f.write(f'{self.my_address}: {mean_loss} start grad time: {start_round_time - self.timestamp} finish grad time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {num_samples}\n')
+            f.write(f'{self.my_address}: apply {mean_loss} start grad time: {start_round_time - self.timestamp} finish grad time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {num_samples}\n')
             wandb.log({
                 "machine_address": self.my_address,
                 "mean_loss": mean_loss,
@@ -406,14 +448,22 @@ class Machine:
                 print(f"Error: could not connect to {address}")
                 continue
 
-    def wait_till_finish(self, count=None, description="initialize"):
+    def wait_till_finish(self, count=None, description="initialize", timeout=100, quit_on_timeout=True):
         # wait for everyone to finish
+        start_time = time.time()
         if count is None:
             count = len(self.all_addresses)
-        while self.num_finish[description] < count: # exclude the current machine
-            print(f"Waiting for machines to {description}... currently {self.num_finish[description] + 1}/{count + 1}")
+        while (len(self.num_finish[description]) < count) and (time.time() - start_time < timeout): # exclude the current machine
+            print(f"Waiting for machines to {description}... currently {len(self.num_finish[description]) + 1}/{count + 1}")
             time.sleep(0.1)
-        self.num_finish[description] = 0
+        if len(self.num_finish[description]) < count:
+            if quit_on_timeout:
+                print(f"Timed out waiting for machines to finish {description}.")
+                sys.exit()
+            missing_addresses = set(self.all_addresses) - self.num_finish[description]
+            print(f"Warning: {missing_addresses} did not {description} in time, removing them from the list of machines.")
+            self.all_addresses = list(set(self.all_addresses) - self.num_finish[description])
+        self.num_finish[description] = set()
 
     def sync(self, description="initialize", count=None):
         if count is None:
@@ -452,6 +502,8 @@ class Machine:
                 print("Applying gradients.")
                 self.apply_all_grads(all_projected_grads)
                 self.total_iterations += 1
+                print("Evaluating model.")
+                self.evaluate_model()
                 self.sync("finish applying gradients")
                 print(f"Finished training for iteration {self.total_iterations} ending at", time.time())
                 if self.all_addresses:  # Choose a random address to check the hash
