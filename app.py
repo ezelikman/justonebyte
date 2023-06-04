@@ -18,6 +18,7 @@ import json
 from collections import defaultdict
 import bitsandbytes as bnb
 import wandb
+import datasets
 
 class Machine:
     def __init__(self, my_address, initial_server_addresses,
@@ -559,7 +560,12 @@ def get_batch(batch_size, dataset, dataset_index, dataset_target_index=None):
     else:
         batch_in = batch[dataset_index]
         target = batch[dataset_target_index]
-        batch = list(zip(*[(str(text + "\n"), str(target)) for text, target in zip(batch_in, target) if text.strip()]))
+        target_feature = dataset.features[dataset_target_index]
+        if isinstance(target_feature, datasets.ClassLabel):
+            target_map = target_feature.int2str
+        else:
+            target_map = lambda x: str(x)
+        batch = list(zip(*[(str(text + "\n"), target_map(target)) for text, target in zip(batch_in, target) if text.strip()]))
     if len(batch) < 3 and batch_size >= 3 and dataset_target_index is None:  # If the batch size doesn't match, try again
         return get_batch(batch_size, dataset, dataset_index, dataset_target_index)
     return batch
