@@ -26,7 +26,7 @@ class Machine:
                 model_name='gpt2', dataset_name=('sst2', 'main'), dataset_index='question',
                 device='best', dtype=torch.float16, use_lora=False, min_num_machines=2, send_full_grad=False,
                 normal=False, use_different_gpu=False, debug=False, gradient_acc_steps=1, learning_rate=1e-1, max_iterations = 300,
-                use_bnb=True,
+                use_bnb=False, conditional=True, target_index='label'
         ):
         self.my_address = my_address
         self.dataset_name = dataset_name  # Name of the dataset to be used
@@ -71,6 +71,12 @@ class Machine:
         self.backup_weights = None
         self.total_iterations = 0
         self.num_finish = defaultdict(set)
+        self.calculate_loss = calculate_conditional_loss if conditional else calculate_loss
+        self.conditional = conditional
+        if self.conditional:
+            self.target_index = target_index
+        else:
+            self.target_index = None
         self.use_different_gpu = use_different_gpu
         self.debug = debug
         self.eval_interval = 1
@@ -267,8 +273,8 @@ class Machine:
         start_round_time = time.time()
         with torch.no_grad():
             for i in range(10):
-                batch = get_batch(self.batch_size, self.dataset['test'], self.dataset_index)
-                loss = calculate_loss(self.model, self.tokenizer, batch)
+                batch = get_batch(self.batch_size, self.dataset['test'], self.dataset_index, self.target_index)
+                loss = self.calculate_loss(self.model, self.tokenizer, batch)
                 losses.append(loss.item())
         with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
             mean_loss = np.mean(losses)
@@ -298,19 +304,19 @@ class Machine:
             print(f"Sample number: {self.sample_number} - inference time remaining: {self.increment_time + start_round_time - time.time() }")
             while self.sending_weights:
                 time.sleep(0.1)
-            batch = get_batch(self.batch_size, self.dataset['train'], self.dataset_index)
+            batch = get_batch(self.batch_size, self.dataset['train'], self.dataset_index, self.target_index)
             if self.normal:
                 self.grad["num_samples"] += 1
-                loss = calculate_loss(self.model, self.tokenizer, batch)
+                loss = self.calculate_loss(self.model, self.tokenizer, batch)
                 loss.backward()
                 self.losses.append(loss.item())
                 print(f"Projected gradient: disabled  - time elapsed: {time.time() - init_time}, loss = {loss.item()}")
             else:
                 self.perturbed = True
                 self.add_perturbation(1, self.timestamp, self.sample_number)
-                loss_1 = calculate_loss(self.model, self.tokenizer, batch).item()
+                loss_1 = self.calculate_loss(self.model, self.tokenizer, batch).item()
                 self.add_perturbation(-2, self.timestamp, self.sample_number)
-                loss_2 = calculate_loss(self.model, self.tokenizer, batch).item()
+                loss_2 = self.calculate_loss(self.model, self.tokenizer, batch).item()
                 self.add_perturbation(1, self.timestamp, self.sample_number)
                 self.perturbed = False
                 self.projected_grads.append((loss_1 - loss_2) / (2 * self.epsilon))
@@ -351,10 +357,10 @@ class Machine:
             print(f"Sample number: {self.sample_number} - inference time remaining: {self.increment_time + start_round_time - time.time() }")
             while self.sending_weights:
                 time.sleep(0.1)
-            batch = get_batch(self.batch_size, self.dataset['train'], self.dataset_index)
+            batch = get_batch(self.batch_size, self.dataset['train'], self.dataset_index, self.target_index)
 
             with torch.no_grad():
-                loss = calculate_loss(self.model, self.tokenizer, batch)
+                loss = self.calculate_loss(self.model, self.tokenizer, batch)
                 self.losses.append(loss.item())
             print(f"Time elapsed: {time.time() - init_time}, loss = {loss.item()}")
 
@@ -522,14 +528,40 @@ def calculate_loss(model, tokenizer, batch):
     loss = outputs.loss
     return loss
 
-def get_batch(batch_size, dataset, dataset_index):
+def calculate_conditional_loss(model, tokenizer, batch_tuple):
+    batch_in, batch_out = batch_tuple
+    # Concatenate the strings
+    batch = [in_str + out_str for in_str, out_str in zip(batch_in, batch_out)]
+    tokenized_batch = tokenizer(batch, return_tensors='pt', padding=True, truncation=True, return_token_type_ids=False if "llama" in tokenizer.name_or_path else None)
+    device = next(model.parameters()).device
+    tokenized_batch = {k: v.to(device) for k, v in tokenized_batch.items()}
+    
+    outputs = model(**tokenized_batch, labels=tokenized_batch["input_ids"])
+
+    labels = tokenized_batch["input_ids"].clone()
+    logits = outputs.logits
+    # Ignore batch_in tokens
+    for i, in_str in enumerate(batch_in):
+        labels[i, :len(tokenizer.encode(in_str))] = -100
+    # Ignore padding tokens
+    labels[labels == tokenizer.pad_token_id] = -100
+    loss_fct = torch.nn.CrossEntropyLoss()
+    loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+    return loss
+
+def get_batch(batch_size, dataset, dataset_index, dataset_target_index=None):
     # Randomly choose indices for batch sampling
     indices = np.random.choice(len(dataset), size=batch_size)
     batch = dataset[indices]  # Select the batch from the dataset
-    batch = batch[dataset_index]
-    batch = [text for text in batch if text.strip()]  # Filter empty strings
-    if len(batch) < 3 and batch_size >= 3:  # If the batch size doesn't match, try again
-        return get_batch(batch_size, dataset, dataset_index)
+    if dataset_target_index is None:
+        batch = batch[dataset_index]
+        batch = [text for text in batch if text.strip()]  # Filter empty strings
+    else:
+        batch_in = batch[dataset_index]
+        target = batch[dataset_target_index]
+        batch = list(zip(*[(str(text + "\n"), str(target)) for text, target in zip(batch_in, target) if text.strip()]))
+    if len(batch) < 3 and batch_size >= 3 and dataset_target_index is None:  # If the batch size doesn't match, try again
+        return get_batch(batch_size, dataset, dataset_index, dataset_target_index)
     return batch
 
 def model_processing(model, dtype, device, use_lora, use_bnb):
@@ -562,7 +594,11 @@ def calculate_hash(model, decimals=3):
     # Ignore differences on the order of epsilon, so we round
     str_model = ""
     for _, param in model.named_parameters():
-        str_model += str((param.data * 10 ** decimals).round().int().cpu().numpy())
+        if isinstance(param, bnb.nn.Params4bit):
+            param_dequantized = bnb.functional.dequantize_4bit(param, param.quant_state, quant_type=self.quant_type)
+            str_model += str((param_dequantized.data * 10 ** decimals).round().int().cpu().numpy())
+        else:
+            str_model += str((param.data * 10 ** decimals).round().int().cpu().numpy())
     serialized_model = str_model.encode()
     model_hash = hashlib.md5(serialized_model).hexdigest()
     print(f"Model hash: {model_hash}")
@@ -599,13 +635,14 @@ if __name__ == '__main__':
     parser.add_argument('--send_full_grad', type=bool, default=False)
     parser.add_argument('--normal', type=bool, default=False)
     parser.add_argument('--use_different_gpu', type=bool, default=False)
+    parser.add_argument('--use_bnb', type=bool, default=False)
     parser.add_argument('--start_ip', type=str, default= "127.0.0.1")
     parser.add_argument('--self_ip', type=str, default= "127.0.0.1")
     parser.add_argument('--debug', type=bool, default=False)
     wandb.init(project="justonebyte")
 
     args = parser.parse_args()
-    server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate, max_iterations=args.max_iterations, dataset_name=args.dataset_name, dataset_index=args.dataset_index)
+    server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate, max_iterations=args.max_iterations, dataset_name=args.dataset_name, dataset_index=args.dataset_index, use_bnb=args.use_bnb)
     #save config
     with open(f'config_{args.self_ip}_{server.timestamp}.json', 'w') as f:
         json.dump(vars(args), f)
