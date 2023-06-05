@@ -350,6 +350,7 @@ class Machine:
     def evaluate_model(self):
         self.sample_number = 0
         self.losses = []
+        self.accuracies = []
         self.model.eval()
 
         start_round_time = time.time()
@@ -361,8 +362,15 @@ class Machine:
             batch = get_batch(self.batch_size, self.dataset['train'], self.dataset_index, self.target_index)
 
             with torch.no_grad():
-                loss = self.calculate_loss(self.model, self.tokenizer, batch)
+                loss, ret_data = self.calculate_loss(self.model, self.tokenizer, batch, return_data=True)
+                target_data, logits = ret_data
+                predicted_tokens = torch.argmax(logits, dim=-1)[:,:-1]
+                target_tokens = target_data['input_ids'][:,1:]
+                target_attention = target_data['attention_mask'][:,1:]
+                matches = (predicted_tokens == target_tokens) | ~target_attention.bool()
+                accuracy = torch.all(matches, dim=-1)
                 self.losses.append(loss.item())
+                self.accuracies.append(accuracy.float().mean().item())
             print(f"Time elapsed: {time.time() - init_time}, loss = {loss.item()}")
 
             # If the elapsed time is greater than the inference time, warn the user
@@ -377,11 +385,13 @@ class Machine:
         # Write mean loss to loss.txt
         with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
             mean_loss = np.mean(self.losses)
+            mean_accuracy = np.mean(self.accuracies)
             f.write(f'{self.my_address}: evaluate {mean_loss} start inference time: {start_round_time - self.timestamp} finish inference time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {self.sample_number}\n')
             wandb.log({
                 "mode": True,
                 "machine_address": self.my_address,
                 "mean_inference_loss": mean_loss,
+                "mean_inference_accuracy": mean_accuracy,
                 "start_inference_time": start_round_time - self.timestamp,
                 "finish_inference_time": time.time() - self.timestamp,
                 "iteration": self.total_iterations,
@@ -521,15 +531,17 @@ class Machine:
 
         self.sync("exit")
 
-def calculate_loss(model, tokenizer, batch):
+def calculate_loss(model, tokenizer, batch, return_data=False):
     tokenized_batch = tokenizer(batch, return_tensors='pt', padding=True, truncation=True, return_token_type_ids=False if "llama" in tokenizer.name_or_path else None)
     device = next(model.parameters()).device
     tokenized_batch = {k: v.to(device) for k, v in tokenized_batch.items()}
     outputs = model(**tokenized_batch, labels=tokenized_batch["input_ids"])
     loss = outputs.loss
+    if return_data:
+        return loss, (tokenized_batch, outputs.logits)
     return loss
 
-def calculate_conditional_loss(model, tokenizer, batch_tuple):
+def calculate_conditional_loss(model, tokenizer, batch_tuple, return_data=False):
     batch_in, batch_out = batch_tuple
     # Concatenate the strings
     batch = [in_str + out_str for in_str, out_str in zip(batch_in, batch_out)]
@@ -537,17 +549,25 @@ def calculate_conditional_loss(model, tokenizer, batch_tuple):
     device = next(model.parameters()).device
     tokenized_batch = {k: v.to(device) for k, v in tokenized_batch.items()}
     
-    outputs = model(**tokenized_batch, labels=tokenized_batch["input_ids"])
+    outputs = model(**tokenized_batch)
 
     labels = tokenized_batch["input_ids"].clone()
     logits = outputs.logits
     # Ignore batch_in tokens
     for i, in_str in enumerate(batch_in):
         labels[i, :len(tokenizer.encode(in_str))] = -100
+        tokenized_batch["attention_mask"][i, :len(tokenizer.encode(in_str))] = 0
     # Ignore padding tokens
     labels[labels == tokenizer.pad_token_id] = -100
+    logits[:, :, tokenizer.pad_token_id] -= 100
+    # Get rid of the last token of logits and the first token of labels
+    logits = logits[:, :-1]
+    labels = labels[:, 1:]
     loss_fct = torch.nn.CrossEntropyLoss()
-    loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+    loss = loss_fct(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+    if return_data:
+        # Remove the input_ids from attention_mask
+        return loss, (tokenized_batch, outputs.logits)
     return loss
 
 def get_batch(batch_size, dataset, dataset_index, dataset_target_index=None):
@@ -562,7 +582,8 @@ def get_batch(batch_size, dataset, dataset_index, dataset_target_index=None):
         target = batch[dataset_target_index]
         target_feature = dataset.features[dataset_target_index]
         if isinstance(target_feature, datasets.ClassLabel):
-            target_map = target_feature.int2str
+            # target_map = target_feature.int2str
+            target_map = lambda x: str(x)
         else:
             target_map = lambda x: str(x)
         batch = list(zip(*[(str(text + "\n"), target_map(target)) for text, target in zip(batch_in, target) if text.strip()]))
