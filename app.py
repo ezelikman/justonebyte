@@ -19,6 +19,17 @@ from collections import defaultdict
 import bitsandbytes as bnb
 import wandb
 import datasets
+import torch
+# torch.cuda.memory._record_memory_history(True)
+
+
+# def oom_observer(device, alloc, device_alloc, device_free):
+#     # snapshot right after an OOM happened
+#     print('saving allocated state during OOM')
+#     snapshot = torch.cuda.memory._snapshot()
+#     pickle.dump(snapshot, open('oom_snapshot.pickle', 'wb'))
+
+# torch._C._cuda_attach_out_of_memory_observer(oom_observer)
 
 class Machine:
     def __init__(self, my_address, initial_server_addresses,
@@ -249,7 +260,7 @@ class Machine:
         for param_name, param in self.model.named_parameters():
             if self.use_lora and 'lora' not in param_name:
                 continue
-            self.grad[param_name] = param.grad.data.clone()
+            self.grad[param_name] = param.grad.data.clone().cpu()
 
     def accumulate_grad(self, scaling_factor, timestamp, sample_number):
         set_seed(self.total_iterations, timestamp - self.min_machine_timestamp, sample_number)
@@ -266,7 +277,7 @@ class Machine:
         for param_name, param in self.model.named_parameters():
             if self.use_lora and 'lora' not in param_name:
                 continue
-            param.data = param.data + scaling_factor * grad[param_name]
+            param.data = param.data + scaling_factor * grad[param_name].to(param.data.device)
     
     def eval(self):
         self.model.eval()
@@ -274,7 +285,7 @@ class Machine:
         start_round_time = time.time()
         with torch.no_grad():
             for i in range(10):
-                batch = get_batch(self.batch_size, self.dataset['test'], self.dataset_index, self.target_index)
+                batch = get_batch(self.batch_size, self.dataset['validation'], self.dataset_index, self.target_index)
                 loss = self.calculate_loss(self.model, self.tokenizer, batch)
                 losses.append(loss.item())
         with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
@@ -310,6 +321,7 @@ class Machine:
                 self.grad["num_samples"] += 1
                 loss = self.calculate_loss(self.model, self.tokenizer, batch)
                 loss.backward()
+                loss = loss.detach()
                 self.losses.append(loss.item())
                 print(f"Projected gradient: disabled  - time elapsed: {time.time() - init_time}, loss = {loss.item()}")
             else:
@@ -527,6 +539,7 @@ def calculate_loss(model, tokenizer, batch):
     tokenized_batch = {k: v.to(device) for k, v in tokenized_batch.items()}
     outputs = model(**tokenized_batch, labels=tokenized_batch["input_ids"])
     loss = outputs.loss
+    del outputs
     return loss
 
 def calculate_conditional_loss(model, tokenizer, batch_tuple):
@@ -645,9 +658,10 @@ if __name__ == '__main__':
     parser.add_argument('--start_ip', type=str, default= "127.0.0.1")
     parser.add_argument('--self_ip', type=str, default= "127.0.0.1")
     parser.add_argument('--debug', type=bool, default=False)
+    parser.add_argument('--conditional', type=bool, default=True)
     
     args = parser.parse_args()
-    server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate, max_iterations=args.max_iterations, dataset_name=args.dataset_name, dataset_index=args.dataset_index, use_bnb=args.use_bnb)
+    server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate, max_iterations=args.max_iterations, dataset_name=args.dataset_name, dataset_index=args.dataset_index, use_bnb=args.use_bnb, conditional=args.conditional)
     wandb.init(project="justonebyte", name = f'{args.model_name}_full_grad={args.send_full_grad}_normal={args.normal}_{server.timestamp}_{args.self_ip}_{args.learning_rate}')
 
     #save config
@@ -658,5 +672,8 @@ if __name__ == '__main__':
     t = Thread(target=server.start_server, args=(args.port,))
     t.daemon = True
     t.start()
-    server.run()
+    try:
+        server.run()
+    except:
+        pass
     sys.exit()
