@@ -674,6 +674,8 @@ if __name__ == '__main__':
     t.start()
     try:
         server.run()
-    except:
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         pass
     sys.exit()
