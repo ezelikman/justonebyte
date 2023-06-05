@@ -713,5 +713,10 @@ if __name__ == '__main__':
     t = Thread(target=server.start_server, args=(args.port,))
     t.daemon = True
     t.start()
-    server.run()
+    try:
+        server.run()
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        pass
     sys.exit()
