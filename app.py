@@ -20,6 +20,7 @@ import bitsandbytes as bnb
 import wandb
 import datasets
 import torch
+import math
 # torch.cuda.memory._record_memory_history(True)
 
 
@@ -38,13 +39,14 @@ class Machine:
                 model_name='gpt2', dataset_name=('sst2', 'main'), dataset_index='question',
                 device='best', dtype=torch.float16, use_lora=False, min_num_machines=2, send_full_grad=False,
                 normal=False, use_different_gpu=False, debug=False, gradient_acc_steps=1, learning_rate=1e-1, max_iterations = 300,
-                use_bnb=False, conditional=True, target_index='label'
+                use_bnb=False, conditional=True, target_index='label', gamma=1e-1
         ):
         self.my_address = my_address
         self.dataset_name = dataset_name  # Name of the dataset to be used
         self.dataset_index = dataset_index  # Index of the dataset to be used
         self.buffer_time = buffer_time  # Time to stop inferencing before end_time
-        self.epsilon = epsilon  # Perturbation size
+        self.epsilon = torch.tensor(math.log(epsilon))  # Perturbation size
+        self.gamma = gamma # Size of update to epsilon
         if device == 'best':
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device  # Device to run model on
@@ -237,6 +239,9 @@ class Machine:
     ### Training functions ###
     def add_perturbation(self, scaling_factor, timestamp, sample_number, debug=False):
         set_seed(self.total_iterations, timestamp - self.min_machine_timestamp, sample_number)
+        if self.gamma > 0:
+            eps_z = torch.normal(mean=0, std=1, size=(1,), dtype=self.dtype, device=self.device)
+            self.epsilon = self.epsilon + scaling_factor * eps_z * self.gamma
         for param_name, param in self.model.named_parameters():
             if self.use_lora and 'lora' not in param_name:
                 continue
@@ -248,13 +253,13 @@ class Machine:
                 if isinstance(param, bnb.nn.Params4bit):
                     param_dequantized = bnb.functional.dequantize_4bit(param, param.quant_state, quant_type=self.quant_type)
                     z = torch.normal(mean=0, std=1, size=param_dequantized.data.size(), device=param_dequantized.data.device, dtype=param_dequantized.data.dtype)
-                    param_dequantized.data = param_dequantized.data + scaling_factor * z * self.epsilon
+                    param_dequantized.data = param_dequantized.data + scaling_factor * z * torch.exp(self.epsilon)
                     param_requantized, param_requantized_state = bnb.functional.quantize_4bit(param_dequantized, quant_type=self.quant_type)
                     param.data = param_requantized.data
                     param.quant_state = param_requantized_state
                 else:
                     z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
-                    param.data = param.data + scaling_factor * z * self.epsilon
+                    param.data = param.data + scaling_factor * z * torch.exp(self.epsilon)
 
     def get_model_grad(self):
         for param_name, param in self.model.named_parameters():
@@ -264,14 +269,15 @@ class Machine:
 
     def accumulate_grad(self, scaling_factor, timestamp, sample_number):
         set_seed(self.total_iterations, timestamp - self.min_machine_timestamp, sample_number)
+        self.epsilon = self.epsilon + scaling_factor * torch.normal(mean=0, std=1, size=(1,), dtype=self.dtype, device=self.device)
         for param_name, param in self.model.named_parameters():
             if self.use_lora and 'lora' not in param_name:
                 continue
             z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
             if param_name not in self.grad:
-                self.grad[param_name] = scaling_factor * z * self.epsilon
+                self.grad[param_name] = scaling_factor * z * torch.exp(self.epsilon)
             else:
-                self.grad[param_name] += scaling_factor * z * self.epsilon
+                self.grad[param_name] += scaling_factor * z * torch.exp(self.epsilon)
 
     def apply_full_grad(self, scaling_factor, grad):
         for param_name, param in self.model.named_parameters():
@@ -301,7 +307,7 @@ class Machine:
             })
         return mean_loss
 
-    def update_weights(self):
+    def update_weights(self, one_byte=False):
         self.grad = {"num_samples": 0}
         self.projected_grads = []
         self.losses = []
@@ -332,8 +338,17 @@ class Machine:
                 loss_2 = self.calculate_loss(self.model, self.tokenizer, batch).item()
                 self.add_perturbation(1, self.timestamp, self.sample_number)
                 self.perturbed = False
-                self.projected_grads.append((loss_1 - loss_2) / (2 * self.epsilon))
+                projected_grad = (loss_1 - loss_2) / (2 * torch.exp(self.epsilon))
+                if one_byte:
+                    # Make it "just one byte"
+                    power = torch.round(torch.log(torch.abs(projected_grad)) * 16)
+                    # Clip the power to the range [-127, 127]
+                    power = torch.clamp(power, -127, 127)
+                    restored_grad = torch.exp(power / 16) * torch.sign(projected_grad)
+                self.projected_grads.append(projected_grad)
                 self.losses.append((loss_1 + loss_2) / 2)
+                if self.use_backup:
+                    self.epsilon = self.backup_epsilon
                 if self.send_full_grad:
                     self.grad["num_samples"] += 1
                     self.accumulate_grad(self.projected_grads[-1], self.timestamp, self.sample_number)
@@ -371,7 +386,7 @@ class Machine:
             print(f"Sample number: {self.sample_number} - inference time remaining: {self.increment_time + start_round_time - time.time() }")
             while self.sending_weights:
                 time.sleep(0.1)
-            batch = get_batch(self.batch_size, self.dataset['train'], self.dataset_index, self.target_index)
+            batch = get_batch(self.batch_size, self.dataset['validation'], self.dataset_index, self.target_index)
 
             with torch.no_grad():
                 loss, ret_data = self.calculate_loss(self.model, self.tokenizer, batch, return_data=True)
@@ -443,7 +458,8 @@ class Machine:
         if self.send_full_grad or self.normal:
             num_samples = sum([all_projected_grads[address]["num_samples"] for address in sorted_addresses])
             for address in sorted_addresses:
-                self.apply_full_grad(-self.learning_rate / num_samples, all_projected_grads[address])
+                cur_prop = (self.max_iterations - self.total_iterations) / self.max_iterations
+                self.apply_full_grad(-self.learning_rate / num_samples * cur_prop, all_projected_grads[address])
         else:
             num_samples = sum([len(all_projected_grads[address]) for address in sorted_addresses])
             for address in sorted_addresses:
@@ -520,6 +536,8 @@ class Machine:
                 if self.use_backup:
                     print("Backing up weights.")
                     self.backup_weights = {k: v.cpu() for k, v in self.model.state_dict().items()}
+                    self.backup_epsilon = self.epsilon
+                    print(f"Setting epsilon to {self.backup_epsilon}")
                 print("Calculating losses.")
                 self.update_weights()
                 self.sync("finish forward pass")
@@ -596,8 +614,8 @@ def get_batch(batch_size, dataset, dataset_index, dataset_target_index=None):
         target = batch[dataset_target_index]
         target_feature = dataset.features[dataset_target_index]
         if isinstance(target_feature, datasets.ClassLabel):
-            # target_map = target_feature.int2str
-            target_map = lambda x: str(x)
+            target_map = target_feature.int2str
+            # target_map = lambda x: str(x)
         else:
             target_map = lambda x: str(x)
         batch = list(zip(*[(str(text + "\n"), target_map(target)) for text, target in zip(batch_in, target) if text.strip()]))
@@ -666,6 +684,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataset_index', type=str, default="sentence")
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--epsilon', type=float, default=1e-3)
+    parser.add_argument('--gamma', type=float, default=0.)
     parser.add_argument('--increment_time', type=float, default=1000)
     parser.add_argument('--learning_rate', type=float, default=1e-1)
     parser.add_argument('--max_iterations', type=int, default=300)
@@ -683,7 +702,7 @@ if __name__ == '__main__':
     parser.add_argument('--conditional', type=bool, default=True)
     
     args = parser.parse_args()
-    server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate, max_iterations=args.max_iterations, dataset_name=args.dataset_name, dataset_index=args.dataset_index, use_bnb=args.use_bnb, conditional=args.conditional)
+    server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate, max_iterations=args.max_iterations, dataset_name=args.dataset_name, dataset_index=args.dataset_index, use_bnb=args.use_bnb, conditional=args.conditional, gamma=args.gamma)
     wandb.init(project="justonebyte", name = f'{args.model_name}_full_grad={args.send_full_grad}_normal={args.normal}_{server.timestamp}_{args.self_ip}_{args.learning_rate}')
 
     #save config
@@ -694,8 +713,5 @@ if __name__ == '__main__':
     t = Thread(target=server.start_server, args=(args.port,))
     t.daemon = True
     t.start()
-    try:
-        server.run()
-    except:
-        pass
+    server.run()
     sys.exit()
