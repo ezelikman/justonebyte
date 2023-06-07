@@ -37,7 +37,7 @@ class Machine:
                 increment_time, buffer_time, inference_time,
                 epsilon=0.001, batch_size=16, use_backup=True,
                 model_name='gpt2', dataset_name=('sst2', 'main'), dataset_index='question',
-                device='best', dtype=torch.bfloat16, use_lora=False, min_num_machines=2, send_full_grad=False,
+                device='best', dtype=torch.float32, use_lora=False, min_num_machines=2, send_full_grad=False,
                 normal=False, use_different_gpu=False, debug=False, gradient_acc_steps=1, learning_rate=1e-1, max_iterations = 300,
                 use_bnb=False, conditional=True, target_index='label', gamma=1e-1, int_class=False
         ):
@@ -74,6 +74,10 @@ class Machine:
         self.dataset = load_dataset(*self.dataset_name)  # Initialize the dataset
         self.label_names = self.dataset['train'].features['label'].names  # Names of the labels
         self.model_name = model_name  # Name of the model to be used
+        if 'gpt2' in model_name:
+            self.postfix = '\nsentiment:\n'
+        else:
+            self.postfix = '\nsentiment: '
         if "llama" in model_name:
             self.tokenizer = LlamaTokenizer.from_pretrained("decapoda-research/" + model_name)
         else:
@@ -278,6 +282,8 @@ class Machine:
                     param.quant_state = param_requantized_state
                 else:
                     z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                    # if param.data.numel() > 1:
+                    #     z *= param.data.std()
                     param.data = param.data + scaling_factor * z * torch.exp(self.epsilon)
 
     def get_model_grad(self):
@@ -310,7 +316,7 @@ class Machine:
         start_round_time = time.time()
         with torch.no_grad():
             for i in range(10):
-                batch = get_batch(self.batch_size, self.dataset['validation'], self.dataset_index, self.target_index, self.int_class)
+                batch = get_batch(self.batch_size, self.dataset['validation'], self.dataset_index, self.target_index, self.int_class, self.postfix)
                 loss = self.calculate_loss(self.model, self.tokenizer, batch, class_labels=self.class_labels)
                 losses.append(loss.item())
         with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
@@ -341,7 +347,7 @@ class Machine:
             print(f"Sample number: {self.sample_number} - inference time remaining: {self.increment_time + start_round_time - time.time() }")
             while self.sending_weights:
                 time.sleep(0.1)
-            batch = get_batch(self.batch_size, self.dataset['train'], self.dataset_index, self.target_index, self.int_class)
+            batch = get_batch(self.batch_size, self.dataset['train'], self.dataset_index, self.target_index, self.int_class, self.postfix)
             if self.normal:
                 self.grad["num_samples"] += 1
                 loss = self.calculate_loss(self.model, self.tokenizer, batch, class_labels=self.class_labels)
@@ -386,11 +392,11 @@ class Machine:
             wandb.log({
                 "mode": "train",
                 "machine_address": self.my_address,
-                "mean_inference_loss": mean_loss,
-                "start_inference_time": start_round_time - self.timestamp,
-                "finish_inference_time": time.time() - self.timestamp,
+                "mean_train_loss": mean_loss,
+                "start_train_time": start_round_time - self.timestamp,
+                "finish_train_time": time.time() - self.timestamp,
                 "iteration": self.total_iterations,
-                "num_inference_samples": self.sample_number
+                "num_train_samples": self.sample_number
             })
 
     def evaluate_model(self):
@@ -405,7 +411,7 @@ class Machine:
             print(f"Sample number: {self.sample_number} - inference time remaining: {self.increment_time + start_round_time - time.time() }")
             while self.sending_weights:
                 time.sleep(0.1)
-            batch = get_batch(self.batch_size, self.dataset['validation'], self.dataset_index, self.target_index, self.int_class)
+            batch = get_batch(self.batch_size, self.dataset['validation'], self.dataset_index, self.target_index, self.int_class, self.postfix)
 
             with torch.no_grad():
                 loss, ret_data = self.calculate_loss(self.model, self.tokenizer, batch, return_data=True, class_labels=self.class_labels)
@@ -434,7 +440,7 @@ class Machine:
             mean_accuracy = np.mean(self.accuracies)
             f.write(f'{self.my_address}: evaluate {mean_loss} start inference time: {start_round_time - self.timestamp} finish inference time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {self.sample_number}\n')
             wandb.log({
-                "mode": True,
+                "mode": "evaluate",
                 "machine_address": self.my_address,
                 "mean_inference_loss": mean_loss,
                 "mean_inference_accuracy": mean_accuracy,
@@ -495,7 +501,6 @@ class Machine:
             f.write(f'{self.my_address}: apply {mean_loss} start grad time: {start_round_time - self.timestamp} finish grad time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {num_samples}\n')
             wandb.log({
                 "machine_address": self.my_address,
-                "mean_grad_loss": mean_loss,
                 "start_grad_time": start_round_time - self.timestamp,
                 "finish_grad_time": time.time() - self.timestamp,
                 "iteration": self.total_iterations,
@@ -574,22 +579,11 @@ class Machine:
                 print(f"Finished training for iteration {self.total_iterations} ending at", time.time())
                 if self.all_addresses:  # Choose a random address to check the hash
                     self.model = confirm_hash(np.random.choice(self.all_addresses), self.model)
-                if self.timestamp == self.min_machine_timestamp:
-                    if self.total_iterations % self.eval_interval == 0:
-                        self.eval()
+                # if self.timestamp == self.min_machine_timestamp:
+                #     if self.total_iterations % self.eval_interval == 0:
+                #         self.eval()
 
         self.sync("exit")
-
-def calculate_loss(model, tokenizer, batch, return_data=False, class_labels=None):
-    tokenized_batch = tokenizer(batch, return_tensors='pt', padding=True, truncation=True, return_token_type_ids=False if "llama" in tokenizer.name_or_path else None)
-    device = next(model.parameters()).device
-    tokenized_batch = {k: v.to(device) for k, v in tokenized_batch.items()}
-    outputs = model(**tokenized_batch, labels=tokenized_batch["input_ids"])
-    loss = outputs.loss
-    if return_data:
-        return loss, (tokenized_batch, outputs.logits)
-    del outputs
-    return loss
 
 def calculate_conditional_loss(model, tokenizer, batch_tuple, return_data=False, class_labels=None):
     batch_in, batch_out = batch_tuple
@@ -605,6 +599,8 @@ def calculate_conditional_loss(model, tokenizer, batch_tuple, return_data=False,
     logits = outputs.logits
     # Ignore batch_in tokens
     for i, in_str in enumerate(batch_in):
+        if in_str[-1] == ' ':
+            in_str = in_str[:-1]
         labels[i, :len(tokenizer.encode(in_str))] = -100
         tokenized_batch["attention_mask"][i, :len(tokenizer.encode(in_str))] = 0
     # Ignore padding tokens
@@ -614,19 +610,36 @@ def calculate_conditional_loss(model, tokenizer, batch_tuple, return_data=False,
         # Ignore tokens that are not in the class labels
         logits[:, :, ~class_labels] -= np.inf
     # Get rid of the last token of logits and the first token of labels
-    logits = logits[:, :-1]
-    labels = labels[:, 1:]
+    train_logits = logits[:, :-1]
+    # Filter to only the tokens that are in the labels
+    target_labels = labels[:, 1:]
     loss_fct = torch.nn.CrossEntropyLoss()
-    loss = loss_fct(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+    loss = loss_fct(
+        train_logits.reshape(
+            -1, train_logits.size(-1)), target_labels.reshape(-1))
+    del outputs
     if return_data:
         # Remove the input_ids from attention_mask
+        return loss, (tokenized_batch, logits)
+    return loss
+
+def calculate_loss(model, tokenizer, batch, return_data=False, class_labels=None):
+    tokenized_batch = tokenizer(batch, return_tensors='pt', padding=True, truncation=True, return_token_type_ids=False if "llama" in tokenizer.name_or_path else None)
+    if class_labels is not None:
+        print("Warning: class_labels is not None, but it is not used in calculate_loss.")
+    device = next(model.parameters()).device
+    tokenized_batch = {k: v.to(device) for k, v in tokenized_batch.items()}
+    outputs = model(**tokenized_batch, labels=tokenized_batch["input_ids"])
+    loss = outputs.loss
+    if return_data:
         return loss, (tokenized_batch, outputs.logits)
     del outputs
     return loss
 
-def get_batch(batch_size, dataset, dataset_index, dataset_target_index=None, int_class=False):
+def get_batch(batch_size, dataset, dataset_index, dataset_target_index=None, int_class=False, postfix="\nsentiment: "):
     # Randomly choose indices for batch sampling
-    indices = np.random.choice(len(dataset), size=batch_size)
+    batch_size = min(batch_size, len(dataset))
+    indices = np.random.choice(len(dataset), size=batch_size, replace=False)
     batch = dataset[indices]  # Select the batch from the dataset
     if dataset_target_index is None:
         batch = batch[dataset_index]
@@ -639,9 +652,9 @@ def get_batch(batch_size, dataset, dataset_index, dataset_target_index=None, int
             target_map = target_feature.int2str
         else:
             target_map = lambda x: str(x)
-        batch = list(zip(*[(str(text + "\n"), target_map(target)) for text, target in zip(batch_in, target) if text.strip()]))
+        batch = list(zip(*[(str(text + postfix), target_map(target)) for text, target in zip(batch_in, target) if text.strip()]))
     if len(batch) < 3 and batch_size >= 3 and dataset_target_index is None:  # If the batch size doesn't match, try again
-        return get_batch(batch_size, dataset, dataset_index, dataset_target_index, int_class)
+        return get_batch(batch_size, dataset, dataset_index, dataset_target_index, int_class, postfix)
     return batch
 
 def model_processing(model, dtype, device, use_lora, use_bnb):
@@ -725,7 +738,7 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
     server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate, max_iterations=args.max_iterations, dataset_name=args.dataset_name, dataset_index=args.dataset_index, use_bnb=args.use_bnb, conditional=args.conditional, gamma=args.gamma, int_class=args.int_class)
-    wandb.init(project="justonebyte", name = f'{args.model_name}_full_grad={args.send_full_grad}_normal={args.normal}_{server.timestamp}_{args.self_ip}_{args.learning_rate}')
+    wandb.init(project="justonebyte", name = f'{args.model_name}_full_grad={args.send_full_grad}_normal={args.normal}_{server.timestamp}_{args.self_ip}_{args.learning_rate}_{args.epsilon}_{args.gamma}')
 
     #save config
     # with open(f'config_{args.self_ip}_{server.timestamp}.json', 'w') as f:
