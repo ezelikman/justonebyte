@@ -36,14 +36,18 @@ class Machine:
     def __init__(self, my_address, initial_server_addresses,
                 increment_time, buffer_time, inference_time,
                 epsilon=0.001, batch_size=16, use_backup=True,
-                model_name='gpt2', dataset_name=('sst2', 'main'), dataset_index='question',
+                model_name='gpt2',
+                # dataset_name=('sst2', 'main'),
+                dataset_name=('glue', 'sst2'),
+                dataset_index='question',
                 device='best', dtype=torch.float32, use_lora=False, min_num_machines=2, send_full_grad=False,
                 normal=False, use_different_gpu=False, debug=False, gradient_acc_steps=1, learning_rate=1e-1, max_iterations = 300,
-                use_bnb=False, conditional=True, target_index='label', gamma=1e-1, int_class=False
+                use_bnb=False, conditional=True, target_index='label', gamma=1e-1, int_class=False, use_variance_scaling=False
         ):
         self.my_address = my_address
         self.dataset_name = dataset_name  # Name of the dataset to be used
         self.dataset_index = dataset_index  # Index of the dataset to be used
+
         self.buffer_time = buffer_time  # Time to stop inferencing before end_time
         self.epsilon = torch.tensor(math.log(epsilon))  # Perturbation size
         self.gamma = gamma # Size of update to epsilon
@@ -54,9 +58,11 @@ class Machine:
         self.dtype = dtype  # Data type to use for training
         self.use_lora = use_lora  # Whether to use LoRA
         self.timestamp = time.time()  # Timestamp used to identify this machine
-
+        self.use_variance_scaling = use_variance_scaling
         self.sample_number = 0  # Number of samples seen so far - reset with each increment
         self.batch_size = batch_size  # Batch size for training
+        self.test_batch_size = 64  # Batch size for testing
+        self.test_iterations = 64  # Number of iterations to test for
         self.end_time = None  # End of the current increment
         self.increment_time = increment_time  # Length of each increment
         self.projected_grads = []  # Projected gradients for each increment
@@ -70,14 +76,18 @@ class Machine:
         self.min_num_machines = min_num_machines  # Minimum number of machines to train with
         if my_address in self.all_addresses:
             self.all_addresses.remove(my_address)
+            self.min_machine_timestamp = self.timestamp
         self.addresses_timestamp = {self.my_address: self.timestamp}  # Timestamps of all known servers
         self.dataset = load_dataset(*self.dataset_name)  # Initialize the dataset
+        self.train_dataset_indices = np.random.choice(len(self.dataset['train']), 16, replace=False)  # Indices of the training dataset
+        self.validation_dataset_indices = np.random.choice(len(self.dataset['validation']), min(1000, len(self.dataset['validation'])), replace=False)  # Indices of the validation dataset
+        self.test_dataset_indices = np.random.choice(len(self.dataset['test']), 16, replace=False)  # Indices of the test dataset
         self.label_names = self.dataset['train'].features['label'].names  # Names of the labels
         self.model_name = model_name  # Name of the model to be used
-        if 'gpt2' in model_name:
-            self.postfix = '\nsentiment:\n'
-        else:
+        if 'llama' in model_name:
             self.postfix = '\nsentiment: '
+        else:
+            self.postfix = '\nsentiment:\n'
         if "llama" in model_name:
             self.tokenizer = LlamaTokenizer.from_pretrained("decapoda-research/" + model_name)
         else:
@@ -116,7 +126,7 @@ class Machine:
             self.target_index = None
         self.use_different_gpu = use_different_gpu
         self.debug = debug
-        self.eval_interval = 1
+        self.eval_interval = 200
         self.gradient_acc_steps=gradient_acc_steps
         self.max_iterations = max_iterations
         self.learning_rate=learning_rate # learning rate for the optimizer; will be overwritten by the main machine if it is not the main machine
@@ -214,7 +224,7 @@ class Machine:
                 ).eval()
             else:
                 self.model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name if not "llama" in self.model_name else "decapoda-research/" + self.model_name
+                    self.model_name if not "llama" in self.model_name else "decapoda-research/" + self.model_name,
                 ).eval()
             wandb.watch(self.model)
         else:
@@ -260,11 +270,12 @@ class Machine:
             self.total_iterations = response['total_iterations']
 
     ### Training functions ###
-    def add_perturbation(self, scaling_factor, timestamp, sample_number, debug=False):
+    def add_perturbation(self, scaling_factor, timestamp, sample_number, use_eps=True, debug=False):
         set_seed(self.total_iterations, timestamp - self.min_machine_timestamp, sample_number)
         if self.gamma > 0:
             eps_z = torch.normal(mean=0, std=1, size=(1,), dtype=self.dtype, device=self.device)
-            self.epsilon = self.epsilon + scaling_factor * eps_z * self.gamma
+            if use_eps:  # We need to make sure we sample epsilon even if we don't use it, to keep the same random seed
+                self.epsilon = self.epsilon + scaling_factor * eps_z * self.gamma
         for param_name, param in self.model.named_parameters():
             if self.use_lora and 'lora' not in param_name:
                 continue
@@ -276,15 +287,22 @@ class Machine:
                 if isinstance(param, bnb.nn.Params4bit):
                     param_dequantized = bnb.functional.dequantize_4bit(param, param.quant_state, quant_type=self.quant_type)
                     z = torch.normal(mean=0, std=1, size=param_dequantized.data.size(), device=param_dequantized.data.device, dtype=param_dequantized.data.dtype)
-                    param_dequantized.data = param_dequantized.data + scaling_factor * z * torch.exp(self.epsilon)
+                    if use_eps:
+                        z = z * torch.exp(self.epsilon)
+                    if self.use_variance_scaling:
+                        scaling_factor = scaling_factor * torch.std(param_dequantized.data)# / self.model_variance
+                    param_dequantized.data = param_dequantized.data + scaling_factor * z                    
                     param_requantized, param_requantized_state = bnb.functional.quantize_4bit(param_dequantized, quant_type=self.quant_type)
                     param.data = param_requantized.data
                     param.quant_state = param_requantized_state
                 else:
                     z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
-                    # if param.data.numel() > 1:
-                    #     z *= param.data.std()
-                    param.data = param.data + scaling_factor * z * torch.exp(self.epsilon)
+                    if use_eps:
+                        z = z * torch.exp(self.epsilon)
+                    if self.use_variance_scaling:
+                        if param.data.numel() > 1:
+                            scaling_factor = scaling_factor * torch.std(param.data)# / self.model_variance
+                    param.data = param.data + scaling_factor * z
 
     def get_model_grad(self):
         for param_name, param in self.model.named_parameters():
@@ -316,7 +334,7 @@ class Machine:
         start_round_time = time.time()
         with torch.no_grad():
             for i in range(10):
-                batch = get_batch(self.batch_size, self.dataset['validation'], self.dataset_index, self.target_index, self.int_class, self.postfix)
+                batch = get_batch(self.batch_size, self.dataset['validation'], self.dataset_index, self.validation_dataset_indices, self.target_index, self.int_class, self.postfix)
                 loss = self.calculate_loss(self.model, self.tokenizer, batch, class_labels=self.class_labels)
                 losses.append(loss.item())
         with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
@@ -347,7 +365,7 @@ class Machine:
             print(f"Sample number: {self.sample_number} - inference time remaining: {self.increment_time + start_round_time - time.time() }")
             while self.sending_weights:
                 time.sleep(0.1)
-            batch = get_batch(self.batch_size, self.dataset['train'], self.dataset_index, self.target_index, self.int_class, self.postfix)
+            batch = get_batch(self.batch_size, self.dataset['train'], self.dataset_index, self.train_dataset_indices, self.target_index, self.int_class, self.postfix)
             if self.normal:
                 self.grad["num_samples"] += 1
                 loss = self.calculate_loss(self.model, self.tokenizer, batch, class_labels=self.class_labels)
@@ -372,7 +390,7 @@ class Machine:
                     restored_grad = torch.exp(power / 16) * torch.sign(projected_grad)
                 self.projected_grads.append(projected_grad)
                 self.losses.append((loss_1 + loss_2) / 2)
-                if self.use_backup:
+                if self.use_backup and self.all_addresses:
                     self.epsilon = self.backup_epsilon
                 if self.send_full_grad:
                     self.grad["num_samples"] += 1
@@ -406,12 +424,12 @@ class Machine:
         self.model.eval()
 
         start_round_time = time.time()
-        while self.sample_number < self.gradient_acc_steps and  (time.time() - start_round_time) < self.increment_time:
+        while self.sample_number < self.test_iterations and  (time.time() - start_round_time) < self.increment_time:
             init_time = time.time()
             print(f"Sample number: {self.sample_number} - inference time remaining: {self.increment_time + start_round_time - time.time() }")
             while self.sending_weights:
                 time.sleep(0.1)
-            batch = get_batch(self.batch_size, self.dataset['validation'], self.dataset_index, self.target_index, self.int_class, self.postfix)
+            batch = get_batch(self.test_batch_size, self.dataset['validation'], self.dataset_index, self.validation_dataset_indices, self.target_index, self.int_class, self.postfix)
 
             with torch.no_grad():
                 loss, ret_data = self.calculate_loss(self.model, self.tokenizer, batch, return_data=True, class_labels=self.class_labels)
@@ -484,7 +502,7 @@ class Machine:
             num_samples = sum([all_projected_grads[address]["num_samples"] for address in sorted_addresses])
             for address in sorted_addresses:
                 cur_prop = (self.max_iterations - self.total_iterations) / self.max_iterations
-                self.apply_full_grad(-self.learning_rate / num_samples * cur_prop, all_projected_grads[address])
+                self.apply_full_grad(-self.learning_rate / math.sqrt(num_samples) * cur_prop, all_projected_grads[address])
         else:
             num_samples = sum([len(all_projected_grads[address]) for address in sorted_addresses])
             for address in sorted_addresses:
@@ -492,9 +510,12 @@ class Machine:
                 for grad_idx, grad in enumerate(address_grads):
                     if self.debug:
                         breakpoint()
+                    cur_prop = (self.max_iterations - self.total_iterations) / self.max_iterations
                     self.add_perturbation(
-                        -self.learning_rate * grad / num_samples,
-                        self.addresses_timestamp[address], grad_idx, self.debug)
+                        -self.learning_rate * grad / math.sqrt(num_samples) * cur_prop,
+                        self.addresses_timestamp[address], grad_idx,
+                        use_eps=False, debug=self.debug
+                    )
         self.perturbed = False
         with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
             mean_loss = np.mean(self.losses)
@@ -540,6 +561,16 @@ class Machine:
         self.notify_finish(description)
         self.wait_till_finish(count, description)
 
+    def calculate_variance(self):
+        self.model_variance = 0
+        self.total_param_items = 0
+        for param in self.model.parameters():
+            self.model_variance += torch.var(param.data)
+            self.total_param_items += 1
+        self.model_variance /= self.total_param_items
+        # We actually want the standard deviation
+        self.model_variance = torch.sqrt(self.model_variance)
+
     def run(self):
         num_joined = 0
         self.announce_existence()
@@ -557,15 +588,21 @@ class Machine:
                 if self.model is None:
                     print("Model not initialized.")
                     self.initialize_model()
-                if self.use_backup:
+                if self.use_backup and self.all_addresses:
                     print("Backing up weights.")
                     self.backup_weights = {k: v.cpu() for k, v in self.model.state_dict().items()}
                     self.backup_epsilon = self.epsilon
                     print(f"Setting epsilon to {self.backup_epsilon}")
+                if self.use_variance_scaling:
+                    # To use variance scaling, we calculate the overall variance of the model
+                    # This isn't actually necessary, but it allows us to use the same epsilon
+                    # Across different runs which is nice for comparison
+                    print("Calculating variance.")
+                    self.calculate_variance()
                 print("Calculating losses.")
                 self.update_weights()
                 self.sync("finish forward pass")
-                if self.use_backup:
+                if self.use_backup and self.all_addresses:
                     print("Restoring weights.")
                     self.model.load_state_dict(self.backup_weights)
                 print("Requesting gradients.")
@@ -573,15 +610,16 @@ class Machine:
                 print("Applying gradients.")
                 self.apply_all_grads(all_projected_grads)
                 self.total_iterations += 1
-                print("Evaluating model.")
-                self.evaluate_model()
                 self.sync("finish applying gradients")
                 print(f"Finished training for iteration {self.total_iterations} ending at", time.time())
                 if self.all_addresses:  # Choose a random address to check the hash
                     self.model = confirm_hash(np.random.choice(self.all_addresses), self.model)
-                # if self.timestamp == self.min_machine_timestamp:
-                #     if self.total_iterations % self.eval_interval == 0:
-                #         self.eval()
+                if self.timestamp == self.min_machine_timestamp:
+                    full_batch_size = (len(self.all_addresses) + 1) * self.gradient_acc_steps
+                    if (self.total_iterations - 1) % (1 + (self.eval_interval // full_batch_size)) == 0:
+                        # self.eval()
+                        print("Evaluating model.")
+                        self.evaluate_model()
 
         self.sync("exit")
 
@@ -636,10 +674,10 @@ def calculate_loss(model, tokenizer, batch, return_data=False, class_labels=None
     del outputs
     return loss
 
-def get_batch(batch_size, dataset, dataset_index, dataset_target_index=None, int_class=False, postfix="\nsentiment: "):
+def get_batch(batch_size, dataset, dataset_index, indices, dataset_target_index=None, int_class=False, postfix="\nsentiment: "):
     # Randomly choose indices for batch sampling
-    batch_size = min(batch_size, len(dataset))
-    indices = np.random.choice(len(dataset), size=batch_size, replace=False)
+    batch_size = min(batch_size, len(indices))
+    indices = list(np.random.choice(indices, size=batch_size, replace=False))
     batch = dataset[indices]  # Select the batch from the dataset
     if dataset_target_index is None:
         batch = batch[dataset_index]
@@ -654,13 +692,15 @@ def get_batch(batch_size, dataset, dataset_index, dataset_target_index=None, int
             target_map = lambda x: str(x)
         batch = list(zip(*[(str(text + postfix), target_map(target)) for text, target in zip(batch_in, target) if text.strip()]))
     if len(batch) < 3 and batch_size >= 3 and dataset_target_index is None:  # If the batch size doesn't match, try again
-        return get_batch(batch_size, dataset, dataset_index, dataset_target_index, int_class, postfix)
+        return get_batch(batch_size, dataset, dataset_index, indices, dataset_target_index, int_class, postfix)
     return batch
 
 def model_processing(model, dtype, device, use_lora, use_bnb):
     if not use_bnb:
         model.to(dtype)  # Process a model after loading it
         model.eval()
+        # from optimum.bettertransformer import BetterTransformer
+        # model = BetterTransformer.transform(model, keep_original_model=True)
         model.to(device)
     if use_lora:
         from peft import get_peft_model, LoraConfig, TaskType
@@ -721,9 +761,10 @@ if __name__ == '__main__':
     parser.add_argument('--gamma', type=float, default=0.)
     parser.add_argument('--increment_time', type=float, default=1000)
     parser.add_argument('--learning_rate', type=float, default=1e-1)
-    parser.add_argument('--max_iterations', type=int, default=300)
+    parser.add_argument('--max_iterations', type=int, default=10000)
     parser.add_argument('--gradient_acc_steps', type=float, default=30)
     parser.add_argument('--buffer_time', type=float, default=0)
+    parser.add_argument('--use_variance_scaling', type=bool, default=False)
     parser.add_argument('--inference_time', type=float, default=1)
     parser.add_argument('--min_num_machines', type=int, default=2)
     parser.add_argument('--send_full_grad', type=bool, default=False)
@@ -737,7 +778,7 @@ if __name__ == '__main__':
     parser.add_argument('--conditional', type=bool, default=True)
     
     args = parser.parse_args()
-    server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate, max_iterations=args.max_iterations, dataset_name=args.dataset_name, dataset_index=args.dataset_index, use_bnb=args.use_bnb, conditional=args.conditional, gamma=args.gamma, int_class=args.int_class)
+    server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate, max_iterations=args.max_iterations, dataset_name=args.dataset_name, dataset_index=args.dataset_index, use_bnb=args.use_bnb, conditional=args.conditional, gamma=args.gamma, int_class=args.int_class, use_variance_scaling=args.use_variance_scaling)
     wandb.init(project="justonebyte", name = f'{args.model_name}_full_grad={args.send_full_grad}_normal={args.normal}_{server.timestamp}_{args.self_ip}_{args.learning_rate}_{args.epsilon}_{args.gamma}')
 
     #save config
