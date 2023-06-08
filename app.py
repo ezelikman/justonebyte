@@ -55,6 +55,8 @@ class Machine:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device  # Device to run model on
         self.model = None  # Model to be trained
+        if normal:
+            dtype = torch.bfloat16  # Too big otherwise
         self.dtype = dtype  # Data type to use for training
         self.use_lora = use_lora  # Whether to use LoRA
         self.timestamp = time.time()  # Timestamp used to identify this machine
@@ -79,7 +81,7 @@ class Machine:
             self.min_machine_timestamp = self.timestamp
         self.addresses_timestamp = {self.my_address: self.timestamp}  # Timestamps of all known servers
         self.dataset = load_dataset(*self.dataset_name)  # Initialize the dataset
-        self.train_dataset_indices = np.random.choice(len(self.dataset['train']), 16, replace=False)  # Indices of the training dataset
+        self.train_dataset_indices = np.random.choice(len(self.dataset['train']), 1000, replace=False)  # Indices of the training dataset
         self.validation_dataset_indices = np.random.choice(len(self.dataset['validation']), min(1000, len(self.dataset['validation'])), replace=False)  # Indices of the validation dataset
         self.test_dataset_indices = np.random.choice(len(self.dataset['test']), 16, replace=False)  # Indices of the test dataset
         self.label_names = self.dataset['train'].features['label'].names  # Names of the labels
@@ -171,7 +173,7 @@ class Machine:
         @self.app.route('/grads', methods=['GET'])
         def get_grads():
             if self.model is not None:
-                if self.send_full_grad or self.normal :
+                if self.send_full_grad or self.normal:
                     if self.normal:
                         self.get_model_grad()
                     return Response(pickle.dumps(self.grad), mimetype='application/octet-stream')
@@ -223,9 +225,15 @@ class Machine:
                     device_map='auto'
                 ).eval()
             else:
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name if not "llama" in self.model_name else "decapoda-research/" + self.model_name,
-                ).eval()
+                if self.normal:
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        self.model_name if not "llama" in self.model_name else "decapoda-research/" + self.model_name,
+                        device_map='auto'
+                    ).eval()
+                else:
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        self.model_name if not "llama" in self.model_name else "decapoda-research/" + self.model_name,
+                    ).eval()
             wandb.watch(self.model)
         else:
             random_address = np.random.choice(self.all_addresses)
@@ -284,7 +292,7 @@ class Machine:
             if self.use_different_gpu:
                 z = torch.normal(mean=0, std=1, size=param.data.size(), dtype=param.data.dtype).to(param.data.device)
             else:
-                if isinstance(param, bnb.nn.Params4bit):
+                if self.use_bnb and isinstance(param, bnb.nn.Params4bit):
                     param_dequantized = bnb.functional.dequantize_4bit(param, param.quant_state, quant_type=self.quant_type)
                     z = torch.normal(mean=0, std=1, size=param_dequantized.data.size(), device=param_dequantized.data.device, dtype=param_dequantized.data.dtype)
                     if use_eps:
@@ -469,6 +477,8 @@ class Machine:
             })
 
     def request_grads_from_all_machines(self):
+        if not self.all_addresses and self.normal:
+            self.get_model_grad()
         all_projected_grads = {
             self.my_address: self.projected_grads if not (self.send_full_grad or self.normal) else self.grad
         }
