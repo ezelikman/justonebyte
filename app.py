@@ -42,7 +42,8 @@ class Machine:
                 dataset_index='question',
                 device='best', dtype=torch.float32, use_lora=False, min_num_machines=2, send_full_grad=False,
                 normal=False, use_different_gpu=False, debug=False, gradient_acc_steps=1, learning_rate=1e-1, max_iterations = 300,
-                use_bnb=False, conditional=True, target_index='label', gamma=1e-1, int_class=False, use_variance_scaling=False
+                use_bnb=False, conditional=True, target_index='label', gamma=1e-1, int_class=False, use_variance_scaling=False,
+                one_byte=False,
         ):
         self.my_address = my_address
         self.dataset_name = dataset_name  # Name of the dataset to be used
@@ -59,6 +60,7 @@ class Machine:
             dtype = torch.bfloat16  # Too big otherwise
         self.dtype = dtype  # Data type to use for training
         self.use_lora = use_lora  # Whether to use LoRA
+        self.one_byte = one_byte
         self.timestamp = time.time()  # Timestamp used to identify this machine
         self.use_variance_scaling = use_variance_scaling
         self.sample_number = 0  # Number of samples seen so far - reset with each increment
@@ -610,7 +612,7 @@ class Machine:
                     print("Calculating variance.")
                     self.calculate_variance()
                 print("Calculating losses.")
-                self.update_weights()
+                self.update_weights(one_byte=self.one_byte)
                 self.sync("finish forward pass")
                 if self.use_backup and self.all_addresses:
                     print("Restoring weights.")
@@ -785,10 +787,11 @@ if __name__ == '__main__':
     parser.add_argument('--start_ip', type=str, default= "127.0.0.1")
     parser.add_argument('--self_ip', type=str, default= "127.0.0.1")
     parser.add_argument('--debug', type=bool, default=False)
+    parser.add_argument('--one_byte', type=bool, default=False)
     parser.add_argument('--conditional', type=bool, default=True)
     
     args = parser.parse_args()
-    server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate, max_iterations=args.max_iterations, dataset_name=args.dataset_name, dataset_index=args.dataset_index, use_bnb=args.use_bnb, conditional=args.conditional, gamma=args.gamma, int_class=args.int_class, use_variance_scaling=args.use_variance_scaling)
+    server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate, max_iterations=args.max_iterations, dataset_name=args.dataset_name, dataset_index=args.dataset_index, use_bnb=args.use_bnb, conditional=args.conditional, gamma=args.gamma, int_class=args.int_class, use_variance_scaling=args.use_variance_scaling, one_byte=args.one_byte)
     wandb.init(project="justonebyte", name = f'{args.model_name}_full_grad={args.send_full_grad}_normal={args.normal}_{server.timestamp}_{args.self_ip}_{args.learning_rate}_{args.epsilon}_{args.gamma}')
 
     #save config
