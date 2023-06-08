@@ -290,7 +290,7 @@ class Machine:
                     if use_eps:
                         z = z * torch.exp(self.epsilon)
                     if self.use_variance_scaling:
-                        scaling_factor = scaling_factor * torch.std(param_dequantized.data)# / self.model_variance
+                        scaling_factor = scaling_factor * torch.std(param_dequantized.data) / self.model_variance
                     param_dequantized.data = param_dequantized.data + scaling_factor * z                    
                     param_requantized, param_requantized_state = bnb.functional.quantize_4bit(param_dequantized, quant_type=self.quant_type)
                     param.data = param_requantized.data
@@ -301,7 +301,7 @@ class Machine:
                         z = z * torch.exp(self.epsilon)
                     if self.use_variance_scaling:
                         if param.data.numel() > 1:
-                            scaling_factor = scaling_factor * torch.std(param.data)# / self.model_variance
+                            scaling_factor = scaling_factor * torch.std(param.data) / self.model_variance
                     param.data = param.data + scaling_factor * z
 
     def get_model_grad(self):
