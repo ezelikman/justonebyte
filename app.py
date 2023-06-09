@@ -171,7 +171,7 @@ class Machine:
         def get_hash():
             while self.perturbed:
                 time.sleep(0.1)
-            return {'hash': calculate_hash(self.model)}
+            return {'hash': calculate_hash(self.model, use_bnb=self.use_bnb)}
 
         @self.app.route('/grads', methods=['GET'])
         def get_grads():
@@ -628,7 +628,7 @@ class Machine:
                 self.sync("finish applying gradients")
                 print(f"Finished training for iteration {self.total_iterations} ending at", time.time())
                 if self.all_addresses:  # Choose a random address to check the hash
-                    self.model = confirm_hash(np.random.choice(self.all_addresses), self.model)
+                    self.model = confirm_hash(np.random.choice(self.all_addresses), self.model, use_bnb=self.use_bnb)
                 full_batch_size = (len(self.all_addresses) + 1) * self.gradient_acc_steps
                 if (self.total_iterations - 1) % (1 + (self.eval_interval // full_batch_size)) == 0:
                     # self.eval()
@@ -736,12 +736,12 @@ def resize_token_embeddings(model, new_size):
     model.resize_token_embeddings(new_size)
     torch.manual_seed(cur_seed)
 
-def calculate_hash(model, decimals=3):
+def calculate_hash(model, decimals=3, use_bnb=False):
     # Calculates the hash of the model to verify the model is the same on all machines
     # Ignore differences on the order of epsilon, so we round
     str_model = ""
     for _, param in model.named_parameters():
-        if isinstance(param, bnb.nn.Params4bit):
+        if use_bnb and isinstance(param, bnb.nn.Params4bit):
             param_dequantized = bnb.functional.dequantize_4bit(param, param.quant_state, quant_type=self.quant_type)
             str_model += str((param_dequantized.data * 10 ** decimals).round().int().cpu().numpy())
         else:
@@ -751,12 +751,12 @@ def calculate_hash(model, decimals=3):
     print(f"Model hash: {model_hash}")
     return model_hash
 
-def confirm_hash(address, model):
+def confirm_hash(address, model, use_bnb=False):
     try:
         response = requests.get(f"{address}/hash")
     except:  # If the hash don't match, the model is reset
         print("Error: No response from address, assuming hash is correct.")
-    if calculate_hash(model) != response.json()['hash']:
+    if calculate_hash(model, use_bnb=use_bnb) != response.json()['hash']:
         import pdb; pdb.set_trace()
         print("Hashes don't match.")
         model = None
