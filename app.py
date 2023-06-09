@@ -45,6 +45,7 @@ class Machine:
                 use_bnb=False, conditional=True, target_index='label', gamma=1e-1, int_class=False, use_variance_scaling=False,
                 one_byte=False,
         ):
+
         self.my_address = my_address
         self.dataset_name = dataset_name  # Name of the dataset to be used
         self.dataset_index = dataset_index  # Index of the dataset to be used
@@ -170,7 +171,7 @@ class Machine:
         def get_hash():
             while self.perturbed:
                 time.sleep(0.1)
-            return {'hash': calculate_hash(self.model)}
+            return {'hash': calculate_hash(self.model, use_bnb=self.use_bnb)}
 
         @self.app.route('/grads', methods=['GET'])
         def get_grads():
@@ -436,7 +437,9 @@ class Machine:
         self.model.eval()
 
         start_round_time = time.time()
-        while self.sample_number < self.test_iterations and  (time.time() - start_round_time) < self.increment_time:
+        # split testing across multiple machines
+        n_machines = len(self.all_addresses) + 1
+        while self.sample_number < (self.test_iterations // n_machines) and (time.time() - start_round_time) < self.increment_time:
             init_time = time.time()
             print(f"Sample number: {self.sample_number} - inference time remaining: {self.increment_time + start_round_time - time.time() }")
             while self.sending_weights:
@@ -740,12 +743,12 @@ def resize_token_embeddings(model, new_size):
     model.resize_token_embeddings(new_size)
     torch.manual_seed(cur_seed)
 
-def calculate_hash(model, decimals=3):
+def calculate_hash(model, decimals=3, use_bnb=False):
     # Calculates the hash of the model to verify the model is the same on all machines
     # Ignore differences on the order of epsilon, so we round
     str_model = ""
     for _, param in model.named_parameters():
-        if isinstance(param, bnb.nn.Params4bit):
+        if use_bnb and isinstance(param, bnb.nn.Params4bit):
             param_dequantized = bnb.functional.dequantize_4bit(param, param.quant_state, quant_type=self.quant_type)
             str_model += str((param_dequantized.data * 10 ** decimals).round().int().cpu().numpy())
         else:
@@ -755,12 +758,12 @@ def calculate_hash(model, decimals=3):
     print(f"Model hash: {model_hash}")
     return model_hash
 
-def confirm_hash(address, model):
+def confirm_hash(address, model, use_bnb=False):
     try:
         response = requests.get(f"{address}/hash")
     except:  # If the hash don't match, the model is reset
         print("Error: No response from address, assuming hash is correct.")
-    if calculate_hash(model) != response.json()['hash']:
+    if calculate_hash(model, use_bnb=use_bnb) != response.json()['hash']:
         import pdb; pdb.set_trace()
         print("Hashes don't match.")
         model = None
