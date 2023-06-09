@@ -21,6 +21,9 @@ import wandb
 import datasets
 import torch
 import math
+from io import BytesIO
+# import dill as pickle
+
 # torch.cuda.memory._record_memory_history(True)
 
 
@@ -402,7 +405,8 @@ class Machine:
                     restored_grad = torch.exp(power / 16) * torch.sign(projected_grad)
                 self.projected_grads.append(projected_grad.item())
                 self.losses.append((loss_1 + loss_2) / 2)
-                if self.use_backup and self.all_addresses:
+                # if self.use_backup and self.all_addresses:
+                if self.use_backup:
                     self.epsilon = self.backup_epsilon
                 if self.send_full_grad:
                     self.grad["num_samples"] += 1
@@ -607,11 +611,19 @@ class Machine:
                 if self.model is None:
                     print("Model not initialized.")
                     self.initialize_model()
-                if self.use_backup and self.all_addresses: 
-                    if (self.total_iterations - 1) % (1 + self.eval_interval) == 0:
-                        print("Backing up weights.")
-                        self.backup_weights = {k: v.cpu() for k, v in self.model.state_dict().items()}
+                # if self.use_backup and self.all_addresses: 
+                if self.use_backup:
+                    print("Backing up weights.")
+                    print(f"start backup {time.time()}")
+                    self.backup_weights = {k: v.cpu() for k, v in self.model.state_dict().items()}
+                    
+                    # # Save the model to memory from GPU
+                    # self.backup_weights = BytesIO()
+                    # # torch.save(self.model, self.backup_weights, _use_new_zipfile_serialization=False)
+                    # pickle.dump(self.model, self.backup_weights)
+                    # self.backup_weights.seek(0)
                     self.backup_epsilon = self.epsilon
+                    print(f"start backup {time.time()}")
                     print(f"Setting epsilon to {self.backup_epsilon}")
                 if self.use_variance_scaling:
                     # To use variance scaling, we calculate the overall variance of the model
@@ -622,9 +634,15 @@ class Machine:
                 print("Calculating losses.")
                 self.update_weights(one_byte=self.one_byte)
                 self.sync("finish forward pass")
-                if self.use_backup and self.all_addresses:
+                # if self.use_backup and self.all_addresses:
+                if self.use_backup:
                     print("Restoring weights.")
                     self.model.load_state_dict(self.backup_weights)
+                    # Load the model from memory to GPU
+                    # del self.model
+                    # self.model = pickle.load(self.backup_weights)
+                    # # self.model = torch.load(self.backup_weights, map_location=self.device)
+                    # self.backup_weights.close()
                 print("Requesting gradients.")
                 all_projected_grads = self.request_grads_from_all_machines()
                 print("Applying gradients.")
@@ -633,14 +651,20 @@ class Machine:
                 self.sync("finish applying gradients")
                 print(f"Finished training for iteration {self.total_iterations} ending at", time.time())
                 
+               
                 if self.timestamp == self.min_machine_timestamp:
-                    if self.all_addresses:  # Choose a random address to check the hash
-                        self.model = confirm_hash(np.random.choice(self.all_addresses), self.model)
+                    
                     full_batch_size = (len(self.all_addresses) + 1) * self.gradient_acc_steps
                     if (self.total_iterations - 1) % (1 + (self.eval_interval // full_batch_size)) == 0:
                         # self.eval()
+                        if self.all_addresses:  # Choose a random address to check the hash
+                            print(f"start hashing {time.time()}")
+                            self.model = confirm_hash(np.random.choice(self.all_addresses), self.model)
+                            print(f"finish hashing {time.time()}")
                         print("Evaluating model.")
                         self.evaluate_model()
+                self.sync("finish round")
+                print(f"Finished training for iteration {self.total_iterations} ending at", time.time())
 
         self.sync("exit")
 
