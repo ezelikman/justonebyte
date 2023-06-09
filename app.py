@@ -22,17 +22,6 @@ import datasets
 import torch
 import math
 
-# torch.cuda.memory._record_memory_history(True)
-
-
-# def oom_observer(device, alloc, device_alloc, device_free):
-#     # snapshot right after an OOM happened
-#     print('saving allocated state during OOM')
-#     snapshot = torch.cuda.memory._snapshot()
-#     pickle.dump(snapshot, open('oom_snapshot.pickle', 'wb'))
-
-# torch._C._cuda_attach_out_of_memory_observer(oom_observer)
-
 class Machine:
     def __init__(self, my_address, initial_server_addresses,
                 increment_time, buffer_time, inference_time,
@@ -133,6 +122,9 @@ class Machine:
         self.use_different_gpu = use_different_gpu
         self.debug = debug
         self.eval_interval = 1000
+        self.backup_interval = 8
+        self.hash_interval = 16
+        assert self.hash_interval % self.backup_interval == 0
         self.gradient_acc_steps=gradient_acc_steps
         self.max_iterations = max_iterations
         self.learning_rate=learning_rate # learning rate for the optimizer; will be overwritten by the main machine if it is not the main machine
@@ -564,8 +556,11 @@ class Machine:
         start_time = time.time()
         if count is None:
             count = len(self.all_addresses)
+        printed_waiting = False
         while (len(self.num_finish[description]) < count) and (time.time() - start_time < timeout): # exclude the current machine
-            print(f"Waiting for machines to {description}... currently {len(self.num_finish[description]) + 1}/{count + 1}")
+            if not printed_waiting:
+                print(f"Waiting for machines to {description}... currently {len(self.num_finish[description]) + 1}/{count + 1}")
+                printed_waiting = True
             time.sleep(0.1)
         if len(self.num_finish[description]) < count:
             if quit_on_timeout:
@@ -592,6 +587,13 @@ class Machine:
         # We actually want the standard deviation
         self.model_variance = torch.sqrt(self.model_variance)
 
+    def restore_grads(self, backup_grads):
+        true_iteration = self.total_iterations
+        for past_iteration, past_grads in backup_grads:
+            self.total_iterations = past_iteration
+            self.apply_all_grads(past_grads)
+        self.total_iterations = true_iteration
+
     def run(self):
         num_joined = 0
         self.announce_existence()
@@ -610,12 +612,13 @@ class Machine:
                     print("Model not initialized.")
                     self.initialize_model()
                 # if self.use_backup and self.all_addresses: 
-                if self.use_backup:
+                if self.use_backup and self.total_iterations % self.backup_interval == 0:
                     print("Backing up weights.")
                     print(f"start backup {time.time()}")
                     self.backup_weights = {k: v.cpu() for k, v in self.model.state_dict().items()}
                     self.backup_epsilon = self.epsilon
-                    print(f"start backup {time.time()}")
+                    self.backup_grads = []
+                    print(f"end backup {time.time()}")
                     print(f"Setting epsilon to {self.backup_epsilon}")
                 if self.use_variance_scaling:
                     # To use variance scaling, we calculate the overall variance of the model
@@ -627,27 +630,31 @@ class Machine:
                 self.update_weights(one_byte=self.one_byte)
                 self.sync("finish forward pass")
                 # if self.use_backup and self.all_addresses:
-                if self.use_backup:
+                if self.use_backup and (self.total_iterations + 1) % self.backup_interval == 0:
                     print("Restoring weights.")
                     self.model.load_state_dict(self.backup_weights)
+                    if len(self.backup_grads) > 0:
+                        print("Restoring gradients.")
+                        restore_grads_time = time.time()
+                        self.restore_grads(self.backup_grads)
+                        print(f"Restoring gradients took {time.time() - restore_grads_time} seconds.")
+                    self.backup_grads = []
                 print("Requesting gradients.")
                 all_projected_grads = self.request_grads_from_all_machines()
+                # self.backup_grads[self.total_iterations] = all_projected_grads
+                self.backup_grads.append((self.total_iterations, all_projected_grads))
                 print("Applying gradients.")
                 self.apply_all_grads(all_projected_grads)
                 self.total_iterations += 1
                 self.sync("finish applying gradients")
-                print(f"Finished training for iteration {self.total_iterations} ending at", time.time())
-                if self.timestamp == self.min_machine_timestamp:
-                    
-                    full_batch_size = (len(self.all_addresses) + 1) * self.gradient_acc_steps
-                    if (self.total_iterations - 1) % (1 + (self.eval_interval // full_batch_size)) == 0:
-                        # self.eval()
-                        if self.all_addresses:  # Choose a random address to check the hash
-                            print(f"start hashing {time.time()}")
-                            self.model = confirm_hash(np.random.choice(self.all_addresses), self.model)
-                            print(f"finish hashing {time.time()}")
-                        print("Evaluating model.")
-                        self.evaluate_model()
+                if self.all_addresses and (self.total_iterations + 1) % self.hash_interval == 0:
+                    print(f"start hashing {time.time()}")
+                    self.model = confirm_hash(np.random.choice(self.all_addresses), self.model)
+                    print(f"finish hashing {time.time()}")
+                full_batch_size = (len(self.all_addresses) + 1) * self.gradient_acc_steps
+                if (self.total_iterations - 1) % (1 + (self.eval_interval // full_batch_size)) == 0:
+                    print("Evaluating model.")
+                    self.evaluate_model()
                 self.sync("finish round")
                 print(f"Finished training for iteration {self.total_iterations} ending at", time.time())
 
@@ -729,8 +736,6 @@ def model_processing(model, dtype, device, use_lora, use_bnb):
     if not use_bnb:
         model.to(dtype)  # Process a model after loading it
         model.eval()
-        # from optimum.bettertransformer import BetterTransformer
-        # model = BetterTransformer.transform(model, keep_original_model=True)
         model.to(device)
     if use_lora:
         from peft import get_peft_model, LoraConfig, TaskType
@@ -813,8 +818,6 @@ if __name__ == '__main__':
     wandb.init(project="justonebyte", name = f'{args.model_name}_full_grad={args.send_full_grad}_normal={args.normal}_{server.timestamp}_{args.self_ip}_{args.learning_rate}_{args.epsilon}_{args.gamma}')
 
     #save config
-    # with open(f'config_{args.self_ip}_{server.timestamp}.json', 'w') as f:
-    #     json.dump(vars(args), f)
     wandb.config.update(args)
 
     t = Thread(target=server.start_server, args=(args.port,))
