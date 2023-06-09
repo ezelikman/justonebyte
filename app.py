@@ -130,7 +130,7 @@ class Machine:
             self.target_index = None
         self.use_different_gpu = use_different_gpu
         self.debug = debug
-        self.eval_interval = 200
+        self.eval_interval = 1000
         self.gradient_acc_steps=gradient_acc_steps
         self.max_iterations = max_iterations
         self.learning_rate=learning_rate # learning rate for the optimizer; will be overwritten by the main machine if it is not the main machine
@@ -347,7 +347,8 @@ class Machine:
                 batch = get_batch(self.batch_size, self.dataset['validation'], self.dataset_index, self.validation_dataset_indices, self.target_index, self.int_class, self.postfix)
                 loss = self.calculate_loss(self.model, self.tokenizer, batch, class_labels=self.class_labels)
                 losses.append(loss.item())
-        with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
+        model_name = self.model_name.split("/")[-1]
+        with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
             mean_loss = np.mean(losses)
             f.write(self.my_address+": " + str(mean_loss) + " start eval time: " + str(start_round_time - self.timestamp)  +" finish eval time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + " num samples: 10\n")
             wandb.log({
@@ -398,7 +399,7 @@ class Machine:
                     # Clip the power to the range [-127, 127]
                     power = torch.clamp(power, -127, 127)
                     restored_grad = torch.exp(power / 16) * torch.sign(projected_grad)
-                self.projected_grads.append(projected_grad)
+                self.projected_grads.append(projected_grad.item())
                 self.losses.append((loss_1 + loss_2) / 2)
                 if self.use_backup and self.all_addresses:
                     self.epsilon = self.backup_epsilon
@@ -414,7 +415,8 @@ class Machine:
         if self.sample_number < self.gradient_acc_steps:
             print("Warning: did not have enough samples to reach desired gradients accumulation steps.")
         # Write mean loss to loss.txt
-        with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
+        model_name = self.model_name.split("/")[-1]
+        with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
             mean_loss = np.mean(self.losses)
             f.write(f'{self.my_address}: train {mean_loss} start inference time: {start_round_time - self.timestamp} finish inference time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {self.sample_number}\n')
             wandb.log({
@@ -463,7 +465,8 @@ class Machine:
             print("Warning: did not have enough samples to reach desired inference steps.")
 
         # Write mean loss to loss.txt
-        with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
+        model_name = self.model_name.split("/")[-1]
+        with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
             mean_loss = np.mean(self.losses)
             mean_accuracy = np.mean(self.accuracies)
             f.write(f'{self.my_address}: evaluate {mean_loss} start inference time: {start_round_time - self.timestamp} finish inference time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {self.sample_number}\n')
@@ -529,7 +532,8 @@ class Machine:
                         use_eps=False, debug=self.debug
                     )
         self.perturbed = False
-        with open(f'{self.model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
+        model_name = self.model_name.split("/")[-1]
+        with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
             mean_loss = np.mean(self.losses)
             f.write(f'{self.my_address}: apply {mean_loss} start grad time: {start_round_time - self.timestamp} finish grad time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {num_samples}\n')
             wandb.log({
@@ -571,7 +575,7 @@ class Machine:
         if count is None:
             count = len(self.all_addresses)
         self.notify_finish(description)
-        self.wait_till_finish(count, description)
+        self.wait_till_finish(count, description, timeout = 200000)
 
     def calculate_variance(self):
         self.model_variance = 0
@@ -600,9 +604,10 @@ class Machine:
                 if self.model is None:
                     print("Model not initialized.")
                     self.initialize_model()
-                if self.use_backup and self.all_addresses:
-                    print("Backing up weights.")
-                    self.backup_weights = {k: v.cpu() for k, v in self.model.state_dict().items()}
+                if self.use_backup and self.all_addresses: 
+                    if (self.total_iterations - 1) % (1 + self.eval_interval) == 0:
+                        print("Backing up weights.")
+                        self.backup_weights = {k: v.cpu() for k, v in self.model.state_dict().items()}
                     self.backup_epsilon = self.epsilon
                     print(f"Setting epsilon to {self.backup_epsilon}")
                 if self.use_variance_scaling:
@@ -624,9 +629,10 @@ class Machine:
                 self.total_iterations += 1
                 self.sync("finish applying gradients")
                 print(f"Finished training for iteration {self.total_iterations} ending at", time.time())
-                if self.all_addresses:  # Choose a random address to check the hash
-                    self.model = confirm_hash(np.random.choice(self.all_addresses), self.model)
+                
                 if self.timestamp == self.min_machine_timestamp:
+                    if self.all_addresses:  # Choose a random address to check the hash
+                        self.model = confirm_hash(np.random.choice(self.all_addresses), self.model)
                     full_batch_size = (len(self.all_addresses) + 1) * self.gradient_acc_steps
                     if (self.total_iterations - 1) % (1 + (self.eval_interval // full_batch_size)) == 0:
                         # self.eval()
@@ -771,9 +777,9 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--epsilon', type=float, default=1e-3)
     parser.add_argument('--gamma', type=float, default=0.)
-    parser.add_argument('--increment_time', type=float, default=1000)
+    parser.add_argument('--increment_time', type=float, default=10000)
     parser.add_argument('--learning_rate', type=float, default=1e-1)
-    parser.add_argument('--max_iterations', type=int, default=10000)
+    parser.add_argument('--max_iterations', type=int, default=500)
     parser.add_argument('--gradient_acc_steps', type=float, default=30)
     parser.add_argument('--buffer_time', type=float, default=0)
     parser.add_argument('--use_variance_scaling', type=bool, default=False)
