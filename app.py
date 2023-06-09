@@ -45,6 +45,7 @@ class Machine:
                 use_bnb=False, conditional=True, target_index='label', gamma=1e-1, int_class=False, use_variance_scaling=False,
                 one_byte=False,
         ):
+
         self.my_address = my_address
         self.dataset_name = dataset_name  # Name of the dataset to be used
         self.dataset_index = dataset_index  # Index of the dataset to be used
@@ -130,7 +131,7 @@ class Machine:
             self.target_index = None
         self.use_different_gpu = use_different_gpu
         self.debug = debug
-        self.eval_interval = 200
+        self.eval_interval = 1000
         self.gradient_acc_steps=gradient_acc_steps
         self.max_iterations = max_iterations
         self.learning_rate=learning_rate # learning rate for the optimizer; will be overwritten by the main machine if it is not the main machine
@@ -434,7 +435,9 @@ class Machine:
         self.model.eval()
 
         start_round_time = time.time()
-        while self.sample_number < self.test_iterations and  (time.time() - start_round_time) < self.increment_time:
+        # split testing across multiple machines
+        n_machines = len(self.all_addresses) + 1
+        while self.sample_number < (self.test_iterations // n_machines) and (time.time() - start_round_time) < self.increment_time:
             init_time = time.time()
             print(f"Sample number: {self.sample_number} - inference time remaining: {self.increment_time + start_round_time - time.time() }")
             while self.sending_weights:
@@ -626,12 +629,11 @@ class Machine:
                 print(f"Finished training for iteration {self.total_iterations} ending at", time.time())
                 if self.all_addresses:  # Choose a random address to check the hash
                     self.model = confirm_hash(np.random.choice(self.all_addresses), self.model)
-                if self.timestamp == self.min_machine_timestamp:
-                    full_batch_size = (len(self.all_addresses) + 1) * self.gradient_acc_steps
-                    if (self.total_iterations - 1) % (1 + (self.eval_interval // full_batch_size)) == 0:
-                        # self.eval()
-                        print("Evaluating model.")
-                        self.evaluate_model()
+                full_batch_size = (len(self.all_addresses) + 1) * self.gradient_acc_steps
+                if (self.total_iterations - 1) % (1 + (self.eval_interval // full_batch_size)) == 0:
+                    # self.eval()
+                    print("Evaluating model.")
+                    self.evaluate_model()
 
         self.sync("exit")
 
