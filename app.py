@@ -122,8 +122,8 @@ class Machine:
         self.use_different_gpu = use_different_gpu
         self.debug = debug
         self.eval_interval = 1000
-        self.backup_interval = 8
-        self.hash_interval = 16
+        self.backup_interval = 16
+        self.hash_interval = 64
         assert self.hash_interval % self.backup_interval == 0
         self.gradient_acc_steps=gradient_acc_steps
         self.max_iterations = max_iterations
