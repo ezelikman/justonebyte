@@ -21,8 +21,6 @@ import wandb
 import datasets
 import torch
 import math
-from io import BytesIO
-# import dill as pickle
 
 # torch.cuda.memory._record_memory_history(True)
 
@@ -616,12 +614,6 @@ class Machine:
                     print("Backing up weights.")
                     print(f"start backup {time.time()}")
                     self.backup_weights = {k: v.cpu() for k, v in self.model.state_dict().items()}
-                    
-                    # # Save the model to memory from GPU
-                    # self.backup_weights = BytesIO()
-                    # # torch.save(self.model, self.backup_weights, _use_new_zipfile_serialization=False)
-                    # pickle.dump(self.model, self.backup_weights)
-                    # self.backup_weights.seek(0)
                     self.backup_epsilon = self.epsilon
                     print(f"start backup {time.time()}")
                     print(f"Setting epsilon to {self.backup_epsilon}")
@@ -638,11 +630,6 @@ class Machine:
                 if self.use_backup:
                     print("Restoring weights.")
                     self.model.load_state_dict(self.backup_weights)
-                    # Load the model from memory to GPU
-                    # del self.model
-                    # self.model = pickle.load(self.backup_weights)
-                    # # self.model = torch.load(self.backup_weights, map_location=self.device)
-                    # self.backup_weights.close()
                 print("Requesting gradients.")
                 all_projected_grads = self.request_grads_from_all_machines()
                 print("Applying gradients.")
@@ -650,8 +637,6 @@ class Machine:
                 self.total_iterations += 1
                 self.sync("finish applying gradients")
                 print(f"Finished training for iteration {self.total_iterations} ending at", time.time())
-                
-               
                 if self.timestamp == self.min_machine_timestamp:
                     
                     full_batch_size = (len(self.all_addresses) + 1) * self.gradient_acc_steps
