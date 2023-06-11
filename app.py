@@ -122,8 +122,10 @@ class Machine:
         self.use_different_gpu = use_different_gpu
         self.debug = debug
         self.eval_interval = 1000
-        self.backup_interval = 16
-        self.hash_interval = 64
+        # self.backup_interval = 16
+        # self.hash_interval = 64
+        self.backup_interval = 4
+        self.hash_interval = 8
         assert self.hash_interval % self.backup_interval == 0
         self.gradient_acc_steps=gradient_acc_steps
         self.max_iterations = max_iterations
@@ -346,6 +348,7 @@ class Machine:
             mean_loss = np.mean(losses)
             f.write(self.my_address+": " + str(mean_loss) + " start eval time: " + str(start_round_time - self.timestamp)  +" finish eval time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + " num samples: 10\n")
             wandb.log({
+                "run_id": self.min_machine_timestamp,
                 "machine_address": self.my_address,
                 "mean_eval_loss": mean_loss,
                 "start_eval_time": start_round_time - self.timestamp,
@@ -415,6 +418,7 @@ class Machine:
             mean_loss = np.mean(self.losses)
             f.write(f'{self.my_address}: train {mean_loss} start inference time: {start_round_time - self.timestamp} finish inference time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {self.sample_number}\n')
             wandb.log({
+                "run_id": self.min_machine_timestamp,
                 "mode": "train",
                 "machine_address": self.my_address,
                 "mean_train_loss": mean_loss,
@@ -468,6 +472,7 @@ class Machine:
             mean_accuracy = np.mean(self.accuracies)
             f.write(f'{self.my_address}: evaluate {mean_loss} start inference time: {start_round_time - self.timestamp} finish inference time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {self.sample_number}\n')
             wandb.log({
+                "run_id": self.min_machine_timestamp,
                 "mode": "evaluate",
                 "machine_address": self.my_address,
                 "mean_inference_loss": mean_loss,
@@ -502,7 +507,7 @@ class Machine:
             all_projected_grads[address] = grad
         return all_projected_grads
 
-    def apply_all_grads(self, all_projected_grads):
+    def apply_all_grads(self, all_projected_grads, log=True):
         while self.sending_weights:
             time.sleep(0.1)
         start_round_time = time.time()
@@ -530,16 +535,18 @@ class Machine:
                     )
         self.perturbed = False
         model_name = self.model_name.split("/")[-1]
-        with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
-            mean_loss = np.mean(self.losses)
-            f.write(f'{self.my_address}: apply {mean_loss} start grad time: {start_round_time - self.timestamp} finish grad time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {num_samples}\n')
-            wandb.log({
-                "machine_address": self.my_address,
-                "start_grad_time": start_round_time - self.timestamp,
-                "finish_grad_time": time.time() - self.timestamp,
-                "iteration": self.total_iterations,
-                "num_grad_samples": num_samples
-            })
+        if log:
+            with open(f'{model_name}_full_grad={self.send_full_grad}_normal={self.normal}_{self.min_machine_timestamp}_{self.learning_rate}.txt', 'a+') as f:
+                mean_loss = np.mean(self.losses)
+                f.write(f'{self.my_address}: apply {mean_loss} start grad time: {start_round_time - self.timestamp} finish grad time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {num_samples}\n')
+                wandb.log({
+                    "run_id": self.min_machine_timestamp,
+                    "machine_address": self.my_address,
+                    "start_grad_time": start_round_time - self.timestamp,
+                    "finish_grad_time": time.time() - self.timestamp,
+                    "iteration": self.total_iterations,
+                    "num_grad_samples": num_samples
+                })
 
 
     def notify_finish(self, description="initialize"):
@@ -591,7 +598,7 @@ class Machine:
         true_iteration = self.total_iterations
         for past_iteration, past_grads in backup_grads:
             self.total_iterations = past_iteration
-            self.apply_all_grads(past_grads)
+            self.apply_all_grads(past_grads, log=False)
         self.total_iterations = true_iteration
 
     def run(self):
@@ -623,13 +630,12 @@ class Machine:
                 if self.use_variance_scaling:
                     # To use variance scaling, we calculate the overall variance of the model
                     # This isn't actually necessary, but it allows us to use the same epsilon
-                    # Across different runs which is nice for comparison
+                    # Across different parts of the model
                     print("Calculating variance.")
                     self.calculate_variance()
                 print("Calculating losses.")
                 self.update_weights(one_byte=self.one_byte)
                 self.sync("finish forward pass")
-                # if self.use_backup and self.all_addresses:
                 if self.use_backup and (self.total_iterations + 1) % self.backup_interval == 0:
                     print("Restoring weights.")
                     self.model.load_state_dict(self.backup_weights)
@@ -639,6 +645,7 @@ class Machine:
                         self.restore_grads(self.backup_grads)
                         print(f"Restoring gradients took {time.time() - restore_grads_time} seconds.")
                     self.backup_grads = []
+                    self.sync("finish restoring weights")
                 print("Requesting gradients.")
                 all_projected_grads = self.request_grads_from_all_machines()
                 # self.backup_grads[self.total_iterations] = all_projected_grads
