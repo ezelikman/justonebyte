@@ -121,11 +121,9 @@ class Machine:
             self.target_index = None
         self.use_different_gpu = use_different_gpu
         self.debug = debug
-        self.eval_interval = 1000
-        # self.backup_interval = 16
-        # self.hash_interval = 64
-        self.backup_interval = 4
-        self.hash_interval = 8
+        self.eval_interval = 128
+        self.backup_interval = 16
+        self.hash_interval = 64
         assert self.hash_interval % self.backup_interval == 0
         self.gradient_acc_steps=gradient_acc_steps
         self.max_iterations = max_iterations
@@ -348,7 +346,7 @@ class Machine:
             mean_loss = np.mean(losses)
             f.write(self.my_address+": " + str(mean_loss) + " start eval time: " + str(start_round_time - self.timestamp)  +" finish eval time: " + str(time.time() - self.timestamp) +  " iteration: " + str(self.total_iterations ) + " num samples: 10\n")
             wandb.log({
-                "run_id": self.min_machine_timestamp,
+                "run_id": str(self.min_machine_timestamp),
                 "machine_address": self.my_address,
                 "mean_eval_loss": mean_loss,
                 "start_eval_time": start_round_time - self.timestamp,
@@ -418,7 +416,7 @@ class Machine:
             mean_loss = np.mean(self.losses)
             f.write(f'{self.my_address}: train {mean_loss} start inference time: {start_round_time - self.timestamp} finish inference time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {self.sample_number}\n')
             wandb.log({
-                "run_id": self.min_machine_timestamp,
+                "run_id": str(self.min_machine_timestamp),
                 "mode": "train",
                 "machine_address": self.my_address,
                 "mean_train_loss": mean_loss,
@@ -472,7 +470,7 @@ class Machine:
             mean_accuracy = np.mean(self.accuracies)
             f.write(f'{self.my_address}: evaluate {mean_loss} start inference time: {start_round_time - self.timestamp} finish inference time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {self.sample_number}\n')
             wandb.log({
-                "run_id": self.min_machine_timestamp,
+                "run_id": str(self.min_machine_timestamp),
                 "mode": "evaluate",
                 "machine_address": self.my_address,
                 "mean_inference_loss": mean_loss,
@@ -540,7 +538,7 @@ class Machine:
                 mean_loss = np.mean(self.losses)
                 f.write(f'{self.my_address}: apply {mean_loss} start grad time: {start_round_time - self.timestamp} finish grad time: {time.time() - self.timestamp} iteration: {self.total_iterations} num samples: {num_samples}\n')
                 wandb.log({
-                    "run_id": self.min_machine_timestamp,
+                    "run_id": str(self.min_machine_timestamp),
                     "machine_address": self.my_address,
                     "start_grad_time": start_round_time - self.timestamp,
                     "finish_grad_time": time.time() - self.timestamp,
@@ -576,6 +574,7 @@ class Machine:
             missing_addresses = set(self.all_addresses) - self.num_finish[description]
             print(f"Warning: {missing_addresses} did not {description} in time, removing them from the list of machines.")
             self.all_addresses = list(set(self.all_addresses) - self.num_finish[description])
+        print(f"All machines finished {description}.")
         self.num_finish[description] = set()
 
     def sync(self, description="initialize", count=None):
@@ -652,12 +651,12 @@ class Machine:
                 self.backup_grads.append((self.total_iterations, all_projected_grads))
                 print("Applying gradients.")
                 self.apply_all_grads(all_projected_grads)
-                self.total_iterations += 1
                 self.sync("finish applying gradients")
                 if self.all_addresses and (self.total_iterations + 1) % self.hash_interval == 0:
                     print(f"start hashing {time.time()}")
                     self.model = confirm_hash(np.random.choice(self.all_addresses), self.model)
                     print(f"finish hashing {time.time()}")
+                self.total_iterations += 1
                 full_batch_size = (len(self.all_addresses) + 1) * self.gradient_acc_steps
                 if (self.total_iterations - 1) % (1 + (self.eval_interval // full_batch_size)) == 0:
                     print("Evaluating model.")
