@@ -516,7 +516,8 @@ class Machine:
         if self.send_full_grad or self.normal:
             num_samples = sum([all_projected_grads[address]["num_samples"] for address in sorted_addresses])
             for address in sorted_addresses:
-                cur_prop = (self.max_iterations - self.total_iterations) / self.max_iterations
+                # cur_prop = (self.max_iterations - self.total_iterations) / self.max_iterations
+                cur_prop = 1
                 self.apply_full_grad(-self.learning_rate / math.sqrt(num_samples) * cur_prop, all_projected_grads[address])
         else:
             num_samples = sum([len(all_projected_grads[address]) for address in sorted_addresses])
@@ -525,7 +526,8 @@ class Machine:
                 for grad_idx, grad in enumerate(address_grads):
                     if self.debug:
                         breakpoint()
-                    cur_prop = (self.max_iterations - self.total_iterations) / self.max_iterations
+                    # cur_prop = (self.max_iterations - self.total_iterations) / self.max_iterations
+                    cur_prop = 1
                     self.add_perturbation(
                         -self.learning_rate * grad / math.sqrt(num_samples) * cur_prop,
                         self.addresses_timestamp[address], grad_idx,
@@ -802,7 +804,7 @@ if __name__ == '__main__':
     parser.add_argument('--gamma', type=float, default=0.)
     parser.add_argument('--increment_time', type=float, default=10000)
     parser.add_argument('--learning_rate', type=float, default=1e-1)
-    parser.add_argument('--max_iterations', type=int, default=500)
+    parser.add_argument('--max_iterations', type=int, default=4000)
     parser.add_argument('--gradient_acc_steps', type=float, default=30)
     parser.add_argument('--buffer_time', type=float, default=0)
     parser.add_argument('--use_variance_scaling', type=bool, default=False)
@@ -821,6 +823,7 @@ if __name__ == '__main__':
     parser.add_argument('--start_port', type=int, default=7000)
     
     args = parser.parse_args()
+    max_iterations = args.max_iterations / args.gradient_acc_steps
     server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:{args.start_port}'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate, max_iterations=args.max_iterations, dataset_name=args.dataset_name, dataset_index=args.dataset_index, use_bnb=args.use_bnb, conditional=args.conditional, gamma=args.gamma, int_class=args.int_class, use_variance_scaling=args.use_variance_scaling, one_byte=args.one_byte)
     wandb.init(project="justonebyte", name = f'{args.model_name}_full_grad={args.send_full_grad}_normal={args.normal}_{server.timestamp}_{args.self_ip}_{args.learning_rate}_{args.epsilon}_{args.gamma}')
 
