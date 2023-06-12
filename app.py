@@ -818,9 +818,10 @@ if __name__ == '__main__':
     parser.add_argument('--debug', type=bool, default=False)
     parser.add_argument('--one_byte', type=bool, default=False)
     parser.add_argument('--conditional', type=bool, default=True)
+    parser.add_argument('--start_port', type=int, default=7000)
     
     args = parser.parse_args()
-    server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:7000'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate, max_iterations=args.max_iterations, dataset_name=args.dataset_name, dataset_index=args.dataset_index, use_bnb=args.use_bnb, conditional=args.conditional, gamma=args.gamma, int_class=args.int_class, use_variance_scaling=args.use_variance_scaling, one_byte=args.one_byte)
+    server = Machine(f'http://{args.self_ip}:{args.port}', [f'http://{args.start_ip}:{args.start_port}'], args.increment_time, args.buffer_time, args.inference_time, epsilon=args.epsilon, batch_size=args.batch_size, model_name=args.model_name, min_num_machines=args.min_num_machines, send_full_grad=args.send_full_grad, normal=args.normal, use_different_gpu=args.use_different_gpu, debug=args.debug, gradient_acc_steps=args.gradient_acc_steps, learning_rate=args.learning_rate, max_iterations=args.max_iterations, dataset_name=args.dataset_name, dataset_index=args.dataset_index, use_bnb=args.use_bnb, conditional=args.conditional, gamma=args.gamma, int_class=args.int_class, use_variance_scaling=args.use_variance_scaling, one_byte=args.one_byte)
     wandb.init(project="justonebyte", name = f'{args.model_name}_full_grad={args.send_full_grad}_normal={args.normal}_{server.timestamp}_{args.self_ip}_{args.learning_rate}_{args.epsilon}_{args.gamma}')
 
     #save config
